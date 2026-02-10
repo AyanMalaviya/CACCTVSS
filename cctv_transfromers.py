@@ -16,7 +16,7 @@ if torch.cuda.is_available():
     print(f"   CUDA Version: {torch.version.cuda}")
 
 # Check video file
-VIDEO_PATH = "input.mp4"
+VIDEO_PATH = "accident.mp4"
 print(f"\n2. Checking video file: {VIDEO_PATH}")
 import os
 if not os.path.exists(VIDEO_PATH):
@@ -55,7 +55,7 @@ try:
     
     model = AutoModelForImageTextToText.from_pretrained(
         MODEL_ID,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         device_map="auto",
         low_cpu_mem_usage=True
     )
@@ -72,7 +72,7 @@ THREAT_KEYWORDS = [
     'robbery', 'robbing', 'stealing', 'theft',
     'vandalism', 'destroying', 'damage',
     'mask', 'balaclava', 'covered face',
-    'threatening', 'aggressive', 'violence'
+    'threatening', 'aggressive', 'violence', 'accident', 'crash', 'collision', 'fire', 'explosion', 'suspicious', 'dangerous'
 ]
 
 print(f"\n4. Starting analysis...")
@@ -109,7 +109,7 @@ while cap.isOpened():
                 "role": "user",
                 "content": [
                     {"type": "image"},
-                    {"type": "text", "text": "Describe what you see in this jewelry store in one sentence."}
+                    {"type": "text", "text": "Describe what you see in this CCTV footage in one sentence."}
                 ]
             }]
             
