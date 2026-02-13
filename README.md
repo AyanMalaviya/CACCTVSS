@@ -1,41 +1,120 @@
-# Context-Aware CCTV Surveillance System
+# 🎥 AI-Powered CCTV Surveillance System
 
-AI-powered jewelry store surveillance using Vision Language Models (VLM) to detect suspicious activities in real-time.
+Real-time threat detection for jewelry stores using Vision Language Models (VLM) and deep learning.
 
-## Features
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
+![React](https://img.shields.io/badge/react-18.0+-61dafb.svg)
+![CUDA](https://img.shields.io/badge/CUDA-12.1+-76B900.svg)
 
-- 🔍 Real-time video analysis using SmolVLM2-2.2B
-- 🚨 Automatic threat detection (weapons, robbery, vandalism)
-- ⚡ GPU-accelerated inference
-- 📊 Per-second frame analysis
-- 🎯 Threat keyword detection system
+## 🌟 Features
 
-## Requirements
+- 🔍 **Real-time Video Analysis** - Process live camera feeds at 1 FPS using SmolVLM2-2.2B
+- 🚨 **Automatic Threat Detection** - Detect weapons, violence, robbery attempts, and suspicious behavior
+- ⚡ **GPU-Accelerated** - Optimized for NVIDIA GPUs with 6GB+ VRAM
+- 🌐 **Web Interface** - Modern React dashboard with live alerts
+- 📊 **WebSocket Streaming** - Real-time bidirectional communication between frontend and backend
+- 🎯 **Multi-Source Support** - Works with webcams, IP cameras, Phone Link cameras, and video files
+- 💾 **Alert Logging** - Timestamped threat logs with descriptions
 
-- Python 3.11+
-- NVIDIA GPU with 6GB+ VRAM (RTX 3060 or better)
-- CUDA 12.1+ compatible drivers
-- Windows 10/11
+## 🏗️ Architecture
+┌──────────────┐ WebSocket ┌───────────────┐ GPU Process ┌──────────────┐
+│ React │ ←────────────→ │ FastAPI │ ──────────────→ │ SmolVLM2 │
+│ Frontend │ (frames + │ Backend │ (inference) │ 2.2B Model │
+│ (Port 3000) │ alerts) │ (Port 8000) │ │ (CUDA) │
+└──────────────┘ └───────────────┘ └──────────────┘
+↓ ↓
+Live Dashboard Threat Classification
+Alert Display Keyword Matching
 
-## Installation
+## 📁 Project Structure
 
-### 1. Clone the repository
+cctv_llamacpp/
+├── backend/
+│ ├── venv_backend/ # Python virtual environment (not in git)
+│ ├── main.py # FastAPI server with WebSocket
+│ ├── cctv_transformers.py # Standalone CLI script (original)
+│ ├── requirements.txt # Python dependencies
+│ └── README_BACKEND.md # Backend documentation
+│
+├── frontend/
+│ ├── node_modules/ # NPM packages (not in git)
+│ ├── public/
+│ ├── src/
+│ │ ├── App.js # Main React component
+│ │ ├── App.css # Dashboard styles
+│ │ └── index.js
+│ ├── package.json # Node dependencies
+│ └── README_FRONTEND.md # Frontend documentation
+│
+├── .gitignore # Git ignore rules
+├── README.md # This file
+└── LICENSE # MIT License
 
-```bash
-git clone https://github.com/YOUR_USERNAME/cctv-surveillance.git
-cd cctv-surveillance
 
-2. Create virtual environment
-bash
-python -m venv venv
-.\venv\Scripts\activate  # Windows
-3. Install PyTorch with CUDA
-bash
+## 🚀 Quick Start
+
+### Prerequisites
+
+- **Python 3.11+** with pip
+- **Node.js 18+** with npm
+- **NVIDIA GPU** with 6GB+ VRAM (RTX 3060 or better)
+- **CUDA 12.1+** compatible drivers
+- **Windows 10/11** (Linux/Mac compatible with minor tweaks)
+
+### Installation
+
+#### 1. Clone Repository
+
+git clone https://github.com/AyanMalaviya/CACCTVSS.git
+cd CACCTVSS
+
+
+
+#### 2. Backend setup
+
+# Navigate to backend
+cd backend
+
+# Create virtual environment
+python -m venv venv_backend
+
+# Activate virtual environment
+.\venv_backend\Scripts\activate   # Windows
+# source venv_backend/bin/activate  # Linux/Mac
+
+# Install PyTorch with CUDA support
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-4. Install dependencies
-bash
+
+# Install other dependencies
 pip install -r requirements.txt
-5. Verify GPU detection
-bash
+
+# Verify GPU detection
 python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
-Should output: CUDA available: True
+
+
+
+#### 3. Frontend setup
+
+# Navigate to frontend (new terminal)
+cd frontend
+
+# Install Node dependencies
+npm install
+
+# Start development server
+npm start
+
+
+#### 4. Running the Application
+# Terminal 1: Start Backend
+
+cd backend
+.\venv_backend\Scripts\activate
+python main.py
+
+
+# Terminal 2: Start Frontend
+
+cd frontend
+npm start
