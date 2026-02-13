@@ -30,7 +30,7 @@ MODEL_ID = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
 processor = AutoProcessor.from_pretrained(MODEL_ID)
 model = AutoModelForImageTextToText.from_pretrained(
     MODEL_ID,
-    torch_dtype=torch.float16,
+    dtype=torch.float16,
     device_map="auto",
 )
 print("✓ Model loaded")
