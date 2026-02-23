@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 import cv2
 import torch
@@ -7,9 +7,13 @@ import numpy as np
 import json
 import base64
 from transformers import AutoProcessor, AutoModelForImageTextToText
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
-from collections import deque
+import gc
+import json
+import os
+from pathlib import Path
+
 
 
 app = FastAPI()
@@ -22,18 +26,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# Load model once
 print("Loading model...")
 MODEL_ID = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
 processor = AutoProcessor.from_pretrained(MODEL_ID)
 model = AutoModelForImageTextToText.from_pretrained(
     MODEL_ID,
-    torch_dtype=torch.float16,
+    dtype=torch.float16,
     device_map="auto",
 )
+model.eval()
 print("✓ Model loaded")
-
 
 THREAT_KEYWORDS = [
     'gun', 'weapon', 'knife', 'axe', 'armed',
@@ -44,89 +46,95 @@ THREAT_KEYWORDS = [
     'threatening', 'aggressive', 'violence',
     'accident', 'crash', 'collision', 'fire',
     'explosion', 'suspicious', 'dangerous',
-    'screwdriver', 'hammer', 'bat', 'crowbar',
+    'screwdriver', 'hammer', 'bat', 'crowbar', 'wrench',
     'running', 'chasing', 'grabbing', 'pulling',
-    'swinging', 'jerking', 'lunging', 'charging'
+    'swinging', 'jerking', 'lunging', 'charging',
+    'striking', 'hitting', 'stabbing', 'pointing'
 ]
 
-# Rolling frame buffer: stores last N frames with timestamps
-BUFFER_SIZE = 4  # Number of frames to analyze together
-frame_buffer = deque(maxlen=BUFFER_SIZE)
+# ── Log Manager ────────────────────────────────────────
+LOG_FILE = Path("surveillance_log.jsonl")  # One JSON per line
 
-# Latest frame holder (always overwritten with newest frame)
-latest_frame_buffer = {
-    "frame": None,
-    "timestamp": None,
-    "lock": asyncio.Lock()
-}
+def write_log(entry: dict):
+    """Append one entry to the log file"""
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
 
-
-def detect_motion(frames: list) -> bool:
+def search_log(query: str, window_minutes: int = 0) -> list:
     """
-    Quick OpenCV motion check before sending to VLM.
-    Returns True if significant motion detected between frames.
-    Saves GPU time by skipping static scenes.
+    Search log for query word/phrase.
+    window_minutes=0 means search all time.
     """
-    if len(frames) < 2:
-        return True  # Always analyze if not enough frames yet
+    if not LOG_FILE.exists():
+        return []
 
-    try:
-        prev = np.array(frames[-2])
-        curr = np.array(frames[-1])
+    results = []
+    query_lower = query.strip().lower()
+    now = datetime.now()
 
-        # Convert to grayscale
-        prev_gray = cv2.cvtColor(prev, cv2.COLOR_RGB2GRAY)
-        curr_gray = cv2.cvtColor(curr, cv2.COLOR_RGB2GRAY)
+    with open(LOG_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
 
-        # Compute absolute difference
-        diff = cv2.absdiff(prev_gray, curr_gray)
-        _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+            # Time window filter
+            if window_minutes > 0:
+                try:
+                    entry_time = datetime.fromisoformat(entry["frame_timestamp"])
+                    if now - entry_time > timedelta(minutes=window_minutes):
+                        continue
+                except Exception:
+                    continue
 
-        # Motion score = percentage of changed pixels
-        motion_score = np.sum(thresh > 0) / thresh.size
+            # Keyword match
+            if query_lower in entry.get("description", "").lower():
+                results.append(entry)
 
-        # Trigger VLM if more than 1.5% pixels changed (catches jerks/sudden moves)
-        return motion_score > 0.015
-
-    except Exception as e:
-        print(f"Motion detection error: {e}")
-        return True  # Fallback: always analyze
+    # Return newest first
+    return list(reversed(results))
 
 
+# ─────────────────────────────────────────────────────
+# CONFIG — tuned for 6GB VRAM + accuracy
+# ─────────────────────────────────────────────────────
+BATCH_SIZE       = 2
+FRAME_W          = 448    # Up from 320 — enough to see objects clearly
+FRAME_H          = 336    # Maintains 4:3 ratio
+COLLECT_INTERVAL = 1.0    # Seconds between frames in a batch
+
+
+# ─────────────────────────────────────────────────────
+# VLM INFERENCE
+# ─────────────────────────────────────────────────────
 def analyze_frames(pil_frames: list, frame_timestamp: str) -> dict:
-    """
-    Send multiple frames as a video sequence to SmolVLM2.
-    SmolVLM2 natively understands temporal sequences across frames.
-    """
     n = len(pil_frames)
 
-    # Build multi-frame message - SmolVLM2 treats this as a video sequence
-    content = []
-
-    # Add all frames first
-    for _ in pil_frames:
-        content.append({"type": "image"})
-
-    # Action-focused prompt - ask about movement and behavior, not just appearance
+    content = [{"type": "image"} for _ in pil_frames]
     content.append({
         "type": "text",
         "text": (
-            f"You are analyzing {n} consecutive CCTV frames taken 1 second apart. "
-            "Describe any actions, movements, or behaviors you observe across these frames in one sentence. "
-            "Focus on what the person is DOING, not just what they look like. "
-            "If you see sudden movements, aggressive actions, or weapons being used, describe them clearly."
+            f"Look carefully at these {n} CCTV frames. "
+            "Describe ONLY what you can directly see RIGHT NOW in these frames in one sentence. "
+            "Do NOT reference anything from outside these frames. "
+            "State the person's exact action and any object they are currently holding. "
+            "If nothing suspicious is visible, say so clearly."
         )
     })
 
     messages = [{"role": "user", "content": content}]
 
     with torch.inference_mode():
+        # Fresh prompt every call — no conversation history
         prompt = processor.apply_chat_template(
             messages,
             add_generation_prompt=True
         )
 
-        # Pass all frames as images list
         inputs = processor(
             text=prompt,
             images=pil_frames,
@@ -135,8 +143,9 @@ def analyze_frames(pil_frames: list, frame_timestamp: str) -> dict:
 
         generated_ids = model.generate(
             **inputs,
-            max_new_tokens=80,  # More tokens for action descriptions
-            do_sample=False
+            max_new_tokens=60,
+            do_sample=False,
+            use_cache=False,          # No KV bleedover between calls
         )
 
         full_text = processor.batch_decode(
@@ -144,8 +153,11 @@ def analyze_frames(pil_frames: list, frame_timestamp: str) -> dict:
             skip_special_tokens=True
         )[0]
 
+        # Extract only the assistant's reply
         if "Assistant:" in full_text:
             text = full_text.split("Assistant:")[-1].strip()
+        elif "\n" in full_text:
+            text = full_text.split("\n")[-1].strip()
         else:
             text = full_text.strip()
 
@@ -153,6 +165,10 @@ def analyze_frames(pil_frames: list, frame_timestamp: str) -> dict:
             text = text.split('.')[0] + '.'
 
     is_threat = any(kw in text.lower() for kw in THREAT_KEYWORDS)
+
+    del inputs, generated_ids
+    torch.cuda.empty_cache()
+    gc.collect()
 
     return {
         "description": text,
@@ -163,6 +179,27 @@ def analyze_frames(pil_frames: list, frame_timestamp: str) -> dict:
     }
 
 
+# ─────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────
+def decode_frame(b64_string: str) -> Image.Image | None:
+    try:
+        img_bytes = base64.b64decode(b64_string)
+        nparr    = np.frombuffer(img_bytes, np.uint8)
+        raw      = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if raw is None:
+            return None
+        raw = cv2.resize(raw, (FRAME_W, FRAME_H))
+        rgb = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(rgb)
+    except Exception as e:
+        print(f"⚠️ Decode error: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────────────
+# ROUTES
+# ─────────────────────────────────────────────────────
 @app.get("/")
 async def root():
     return {"status": "CCTV Backend Running", "model": MODEL_ID}
@@ -181,129 +218,155 @@ async def get_cameras():
     return {"cameras": available}
 
 
-async def frame_receiver(websocket: WebSocket):
-    """Continuously receive frames and keep only the latest"""
-    try:
-        while True:
-            data = await websocket.receive_text()
-            frame_data = json.loads(data)
-
-            async with latest_frame_buffer["lock"]:
-                latest_frame_buffer["frame"] = frame_data['frame']
-                latest_frame_buffer["timestamp"] = frame_data.get(
-                    'timestamp', datetime.now().isoformat()
-                )
-
-    except Exception as e:
-        print(f"Frame receiver stopped: {e}")
-
-
-async def frame_processor(websocket: WebSocket):
-    """
-    Process latest frame:
-    1. Add to rolling buffer
-    2. Check for motion
-    3. Send buffer to SmolVLM2 for temporal analysis
-    """
-    try:
-        while True:
-            # Wait for new frame
-            async with latest_frame_buffer["lock"]:
-                if latest_frame_buffer["frame"] is None:
-                    await asyncio.sleep(0.1)
-                    continue
-
-                # Grab latest frame and clear slot
-                frame_b64 = latest_frame_buffer["frame"]
-                frame_timestamp = latest_frame_buffer["timestamp"]
-                latest_frame_buffer["frame"] = None
-
-            try:
-                # Decode frame
-                img_bytes = base64.b64decode(frame_b64)
-                nparr = np.frombuffer(img_bytes, np.uint8)
-                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-                if frame is None:
-                    continue
-
-                # Resize
-                frame = cv2.resize(frame, (640, 480))
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                pil_img = Image.fromarray(frame_rgb)
-
-                # Add to rolling buffer
-                frame_buffer.append(pil_img)
-
-                # Check motion before sending to VLM (saves GPU)
-                buffer_list = list(frame_buffer)
-                rgb_list = [np.array(f) for f in buffer_list]
-                motion_detected = detect_motion(rgb_list)
-
-                if not motion_detected:
-                    print(f"⏭️ Static scene - skipping VLM analysis")
-                    continue
-
-                # Run temporal inference in thread pool
-                loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(
-                    None,
-                    analyze_frames,
-                    buffer_list,
-                    frame_timestamp
-                )
-
-                # Send result to frontend
-                await websocket.send_json(result)
-
-                if result['is_threat']:
-                    print(
-                        f"🚨 THREAT at {frame_timestamp} "
-                        f"[{result['frames_analyzed']} frames]: "
-                        f"{result['description']}"
-                    )
-                else:
-                    print(
-                        f"✓ {frame_timestamp} "
-                        f"[{result['frames_analyzed']} frames]: "
-                        f"{result['description'][:60]}..."
-                    )
-
-                torch.cuda.empty_cache()
-
-            except Exception as e:
-                print(f"⚠️ Processing error: {e}")
-
-            await asyncio.sleep(0.01)
-
-    except Exception as e:
-        print(f"Frame processor stopped: {e}")
-
-
+# ─────────────────────────────────────────────────────
+# WEBSOCKET
+# ─────────────────────────────────────────────────────
 @app.websocket("/ws/camera")
 async def camera_websocket(websocket: WebSocket):
     await websocket.accept()
     print("✓ Client connected")
 
-    # Clear buffer for new connection
-    frame_buffer.clear()
-    async with latest_frame_buffer["lock"]:
-        latest_frame_buffer["frame"] = None
-        latest_frame_buffer["timestamp"] = None
-
     await websocket.send_json({
-        "description": "Connected. Warming up temporal buffer...",
+        "description": "Connected. Ready.",
         "is_threat": False,
         "frames_analyzed": 0,
         "frame_timestamp": datetime.now().isoformat(),
         "analysis_timestamp": datetime.now().isoformat()
     })
 
+    is_processing = False
+    batch         = []
+    batch_ts      = []
+
+@app.get("/api/logs/search")
+async def search_logs(
+    q: str = Query(..., description="Search keyword or phrase"),
+    window: int = Query(0, description="Time window in minutes (0 = all time)")
+):
+    """Search surveillance log"""
+    if not q.strip():
+        return {"query": q, "window_minutes": window, "count": 0, "results": []}
+
+    results = search_log(q.strip(), window)
+
+    return {
+        "query": q,
+        "window_minutes": window,
+        "count": len(results),
+        "results": results
+    }
+
+
+@app.get("/api/logs/stats")
+async def log_stats():
+    """Get log statistics"""
+    if not LOG_FILE.exists():
+        return {"total": 0, "threats": 0, "normal": 0}
+
+    total = threats = 0
+    with open(LOG_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                total += 1
+                if entry.get("is_threat"):
+                    threats += 1
+            except Exception:
+                continue
+
+    return {
+        "total": total,
+        "threats": threats,
+        "normal": total - threats
+    }
+
+
     try:
-        await asyncio.gather(
-            frame_receiver(websocket),
-            frame_processor(websocket)
-        )
+        while True:
+            try:
+                raw_data = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                print("⚠️ No frame for 10s")
+                continue
+
+            # Skip frames while model is busy
+            if is_processing:
+                continue
+
+            try:
+                frame_data = json.loads(raw_data)
+            except json.JSONDecodeError:
+                continue
+
+            pil_img = decode_frame(frame_data.get('frame', ''))
+            if pil_img is None:
+                continue
+
+            timestamp = frame_data.get('timestamp', datetime.now().isoformat())
+            batch.append(pil_img)
+            batch_ts.append(timestamp)
+
+            print(f"📥 Frame {len(batch)}/{BATCH_SIZE} collected at {timestamp}")
+
+            # Wait between frames in same batch
+            if len(batch) < BATCH_SIZE:
+                await asyncio.sleep(COLLECT_INTERVAL)
+                continue
+
+            # Batch full — process it
+            is_processing  = True
+            frames_to_send = batch.copy()
+            ts_to_send     = batch_ts[0]
+
+            batch.clear()
+            batch_ts.clear()
+
+            print(f"🔍 Analyzing {len(frames_to_send)} frames...")
+
+            try:
+                loop   = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    analyze_frames,
+                    frames_to_send,
+                    ts_to_send
+                )
+
+                await websocket.send_json(result)
+
+                if result['is_threat']:
+                    print(f"🚨 THREAT [{ts_to_send}]: {result['description']}")
+                else:
+                    print(f"✅ [{ts_to_send}]: {result['description'][:80]}...")
+                # In processor_loop, after result = await loop.run_in_executor(...)
+                write_log({
+                    "frame_timestamp":    result["frame_timestamp"],
+                    "analysis_timestamp": result["analysis_timestamp"],
+                    "description":        result["description"],
+                    "is_threat":          result["is_threat"],
+                    "frames_analyzed":    result.get("frames_analyzed", 1)
+                })
+
+
+            except Exception as e:
+                print(f"⚠️ Inference error: {e}")
+                await websocket.send_json({
+                    "description": "Inference error — retrying next batch",
+                    "is_threat": False,
+                    "frames_analyzed": len(frames_to_send),
+                    "frame_timestamp": ts_to_send,
+                    "analysis_timestamp": datetime.now().isoformat()
+                })
+
+            finally:
+                is_processing = False
+                print("✅ Ready for next batch\n")
 
     except WebSocketDisconnect:
         print("✗ Client disconnected")
