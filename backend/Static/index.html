@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>CCTV Surveillance — Qwen3-VL-8B</title>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{font-family:'Segoe UI',sans-serif;background:#0f0f1e;color:#fff;min-height:100vh}
+
+    /* HEADER */
+    .header{
+      background:linear-gradient(135deg,#667eea,#764ba2);
+      padding:1.25rem 2rem;
+      display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;
+    }
+    .header h1{font-size:1.6rem}
+    .header p{opacity:.85;font-size:.9rem;margin-top:.2rem}
+    .header-right{display:flex;align-items:center;gap:1.5rem;flex-wrap:wrap}
+
+    .stats-bar{display:flex;gap:.75rem}
+    .stat{
+      display:flex;flex-direction:column;align-items:center;
+      background:rgba(255,255,255,.15);padding:.35rem .85rem;border-radius:8px;min-width:60px
+    }
+    .stat-val{font-size:1.2rem;font-weight:700}
+    .stat-lbl{font-size:.65rem;opacity:.85}
+    .stat.t{background:rgba(239,68,68,.3)}
+    .stat.s{background:rgba(16,185,129,.3)}
+
+    .badge{
+      display:inline-flex;align-items:center;gap:.4rem;
+      padding:.4rem .9rem;background:rgba(255,255,255,.2);
+      border-radius:20px;font-size:.85rem;font-weight:600
+    }
+    .dot{width:9px;height:9px;border-radius:50%;background:#6b7280}
+    .badge.connected .dot{background:#10b981;animation:pulse 2s infinite}
+    .badge.error .dot{background:#ef4444}
+
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+    /* TABS */
+    .tabs{
+      display:flex;background:#16213e;
+      border-bottom:2px solid #1e2a4a;padding:0 2rem
+    }
+    .tab{
+      background:none;border:none;color:#9ca3af;
+      padding:.9rem 1.4rem;font-size:.95rem;font-weight:600;
+      cursor:pointer;border-bottom:3px solid transparent;
+      margin-bottom:-2px;transition:all .2s;
+    }
+    .tab:hover{color:#fff}
+    .tab.active{color:#667eea;border-bottom-color:#667eea}
+    .tab-count{
+      background:#667eea;color:#fff;font-size:.7rem;
+      padding:.1rem .45rem;border-radius:10px;margin-left:.4rem
+    }
+
+    /* LAYOUT */
+    .container{
+      display:grid;grid-template-columns:2fr 1fr;
+      gap:1.5rem;padding:1.5rem;max-width:1600px;margin:0 auto
+    }
+    @media(max-width:1024px){.container{grid-template-columns:1fr}}
+
+    /* VIDEO */
+    .panel{
+      background:#1a1a2e;border-radius:12px;
+      padding:1.25rem;box-shadow:0 8px 16px rgba(0,0,0,.4)
+    }
+    .vid-wrap{
+      background:#000;border-radius:8px;overflow:hidden;
+      position:relative;padding-bottom:75%
+    }
+    #canvas{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover}
+    .vid-overlay{
+      position:absolute;top:0;left:0;width:100%;height:100%;
+      display:flex;align-items:center;justify-content:center;
+      background:rgba(0,0,0,.7);color:#9ca3af;font-size:1rem
+    }
+    .controls{margin-top:1.25rem;text-align:center}
+    .btn{
+      padding:.85rem 2rem;font-size:1rem;border:none;
+      border-radius:8px;cursor:pointer;font-weight:600;transition:all .2s
+    }
+    .btn-start{background:#10b981;color:#fff}
+    .btn-start:hover{background:#059669;transform:translateY(-2px)}
+    .btn-stop{background:#ef4444;color:#fff}
+    .btn-stop:hover{background:#dc2626;transform:translateY(-2px)}
+
+    .status-bar{
+      margin-top:1.25rem;padding:.85rem 1rem;
+      background:#16213e;border-radius:8px;
+      display:flex;align-items:center;gap:.85rem
+    }
+    .s-dot{width:11px;height:11px;border-radius:50%;background:#6b7280;flex-shrink:0}
+    .status-bar.active .s-dot{background:#10b981;animation:pulse 2s infinite}
+    #status-text{font-size:.9rem;color:#d1d5db;flex:1}
+
+    /* ALERTS */
+    .alerts-panel{
+      background:#1a1a2e;border-radius:12px;
+      padding:1.25rem;display:flex;flex-direction:column;
+      box-shadow:0 8px 16px rgba(0,0,0,.4)
+    }
+    .alerts-panel h2{font-size:1.3rem;margin-bottom:.3rem}
+    .a-count{color:#9ca3af;font-size:.8rem;margin-bottom:.9rem}
+    .alerts-list{flex:1;max-height:560px;overflow-y:auto}
+    .alerts-list::-webkit-scrollbar{width:5px}
+    .alerts-list::-webkit-scrollbar-thumb{background:#667eea;border-radius:3px}
+
+    .no-alerts{text-align:center;padding:2.5rem 1rem;color:#6b7280}
+    .no-alerts .icon{font-size:2.5rem;margin-bottom:.75rem}
+
+    .alert-card{
+      background:linear-gradient(135deg,#ef4444,#dc2626);
+      padding:.9rem;border-radius:8px;margin-bottom:.7rem;
+      animation:slideIn .3s ease;
+    }
+    @keyframes slideIn{from{opacity:0;transform:translateX(15px)}to{opacity:1;transform:translateX(0)}}
+    .a-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:.5rem}
+    .a-date{background:rgba(255,255,255,.2);padding:.2rem .6rem;border-radius:10px;font-size:.75rem;font-weight:600}
+    .copy-btn{
+      background:rgba(255,255,255,.2);border:none;padding:.2rem .6rem;
+      border-radius:6px;color:#fff;font-size:.75rem;cursor:pointer;transition:all .2s
+    }
+    .copy-btn:hover{background:rgba(255,255,255,.35)}
+    .a-times{display:grid;grid-template-columns:1fr 1fr;gap:.5rem;margin-bottom:.5rem}
+    .a-time{background:rgba(0,0,0,.2);padding:.4rem .5rem;border-radius:6px}
+    .t-lbl{font-size:.65rem;opacity:.8;display:block}
+    .t-val{font-size:.85rem;font-weight:600;font-family:monospace}
+    .a-desc{font-size:.9rem;line-height:1.4}
+    .clear-btn{
+      width:100%;padding:.65rem;margin-top:.75rem;
+      background:#4b5563;color:#fff;border:none;border-radius:8px;
+      cursor:pointer;font-size:.85rem;font-weight:600;transition:all .2s
+    }
+    .clear-btn:hover{background:#374151}
+
+    /* SEARCH PAGE */
+    .search-page{max-width:960px;margin:0 auto;padding:1.5rem}
+    .search-panel{
+      background:#1a1a2e;border-radius:12px;
+      padding:1.25rem;margin-bottom:1rem;
+      box-shadow:0 4px 12px rgba(0,0,0,.3)
+    }
+    .search-row{display:flex;gap:.65rem;margin-bottom:.9rem}
+    .search-wrap{
+      flex:1;display:flex;align-items:center;gap:.65rem;
+      background:#16213e;border:2px solid #2d3a5e;
+      border-radius:10px;padding:0 .9rem;transition:border-color .2s
+    }
+    .search-wrap:focus-within{border-color:#667eea}
+    .s-icon{opacity:.6;font-size:1rem}
+    #search-input{
+      flex:1;background:none;border:none;outline:none;
+      color:#fff;font-size:.95rem;padding:.8rem 0
+    }
+    #search-input::placeholder{color:#6b7280}
+    .clear-input{
+      background:none;border:none;color:#6b7280;
+      cursor:pointer;font-size:.9rem;padding:.2rem
+    }
+    .clear-input:hover{color:#fff}
+    .btn-search{
+      background:linear-gradient(135deg,#667eea,#764ba2);
+      color:#fff;padding:.8rem 1.5rem;white-space:nowrap;border-radius:8px
+    }
+    .btn-search:hover:not(:disabled){opacity:.9;transform:translateY(-1px)}
+    .btn-search:disabled{opacity:.5;cursor:not-allowed}
+
+    .chips{display:flex;align-items:center;flex-wrap:wrap;gap:.4rem}
+    .chips-lbl{color:#9ca3af;font-size:.8rem;margin-right:.2rem}
+    .chip{
+      background:#16213e;border:1.5px solid #2d3a5e;color:#9ca3af;
+      padding:.3rem .75rem;border-radius:20px;font-size:.78rem;
+      cursor:pointer;transition:all .2s
+    }
+    .chip:hover{border-color:#667eea;color:#fff}
+    .chip.active{background:#667eea;border-color:#667eea;color:#fff;font-weight:600}
+
+    .quick-tags{display:flex;align-items:center;flex-wrap:wrap;gap:.45rem;margin-bottom:1.25rem}
+    .q-lbl{color:#9ca3af;font-size:.8rem;margin-right:.2rem}
+    .qtag{
+      background:#1a1a2e;border:1.5px solid #2d3a5e;color:#a78bfa;
+      padding:.25rem .7rem;border-radius:6px;font-size:.78rem;
+      cursor:pointer;transition:all .2s
+    }
+    .qtag:hover{background:#2d1b6e;border-color:#a78bfa}
+
+    .results-meta{
+      color:#9ca3af;font-size:.85rem;padding:.65rem 1rem;
+      background:#1a1a2e;border-radius:8px;margin-bottom:.75rem
+    }
+    .results-meta strong{color:#fff}
+
+    .empty-state{
+      text-align:center;padding:3.5rem 2rem;
+      background:#1a1a2e;border-radius:12px;color:#6b7280
+    }
+    .empty-icon{font-size:2.8rem;margin-bottom:.75rem}
+    .empty-state p{font-size:1rem;margin-bottom:.4rem;color:#9ca3af}
+    .empty-state small{font-size:.82rem;opacity:.7}
+
+    .spinner{
+      width:36px;height:36px;border:3px solid #2d3a5e;
+      border-top-color:#667eea;border-radius:50%;
+      animation:spin .8s linear infinite;margin:0 auto 1rem
+    }
+    @keyframes spin{to{transform:rotate(360deg)}}
+
+    .log-entry{
+      background:#1a1a2e;border-radius:10px;
+      padding:.9rem 1.1rem;display:flex;align-items:flex-start;
+      gap:.9rem;border-left:4px solid #2d3a5e;
+      transition:transform .15s;margin-bottom:.6rem
+    }
+    .log-entry:hover{transform:translateX(3px)}
+    .log-entry.threat{border-left-color:#ef4444;background:#1f1515}
+    .log-entry.safe{border-left-color:#10b981}
+    .log-icon{font-size:1.3rem;padding-top:.1rem}
+    .log-body{flex:1}
+    .log-desc{font-size:.92rem;line-height:1.5;margin-bottom:.45rem;color:#e5e7eb}
+    .log-meta{display:flex;flex-wrap:wrap;gap:.65rem;align-items:center}
+    .log-date,.log-time,.log-frames{font-size:.75rem;color:#9ca3af}
+    .log-badge{
+      font-size:.68rem;font-weight:700;padding:.15rem .55rem;
+      border-radius:10px;letter-spacing:.4px
+    }
+    .log-badge.threat{background:rgba(239,68,68,.25);color:#f87171}
+    .log-badge.safe{background:rgba(16,185,129,.2);color:#6ee7b7}
+    .copy-sm{
+      background:#16213e;border:1.5px solid #2d3a5e;
+      padding:.35rem .55rem;border-radius:6px;
+      font-size:.9rem;cursor:pointer;color:#9ca3af;
+      transition:all .2s;flex-shrink:0
+    }
+    .copy-sm:hover{border-color:#667eea;color:#fff}
+    mark{background:#fbbf24;color:#000;border-radius:3px;padding:0 2px}
+    .hidden{display:none!important}
+    @media(max-width:768px){
+      .header{flex-direction:column;text-align:center}
+      .search-row{flex-direction:column}
+      .a-times{grid-template-columns:1fr}
+    }
+  </style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header class="header">
+  <div>
+    <h1>🎥 CCTV Surveillance System</h1>
+    <p>Qwen3-VL-8B — Real-Time Threat Detection</p>
+  </div>
+  <div class="header-right">
+    <div class="stats-bar">
+      <div class="stat">
+        <span class="stat-val" id="stat-total">0</span>
+        <span class="stat-lbl">Total</span>
+      </div>
+      <div class="stat t">
+        <span class="stat-val" id="stat-threats">0</span>
+        <span class="stat-lbl">Threats</span>
+      </div>
+      <div class="stat s">
+        <span class="stat-val" id="stat-safe">0</span>
+        <span class="stat-lbl">Safe</span>
+      </div>
+    </div>
+    <div class="badge" id="conn-badge">
+      <span class="dot"></span>
+      <span id="conn-text">Offline</span>
+    </div>
+  </div>
+</header>
+
+<!-- TABS -->
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('live',this)">📹 Live Monitor</button>
+  <button class="tab" onclick="switchTab('search',this)">
+    🔍 Log Search <span class="tab-count" id="tab-count">0</span>
+  </button>
+</div>
+
+<!-- LIVE TAB -->
+<div id="tab-live" class="container">
+  <div class="panel">
+    <video id="video" autoplay playsinline muted style="display:none"></video>
+    <div class="vid-wrap">
+      <canvas id="canvas" width="640" height="480"></canvas>
+      <div class="vid-overlay" id="vid-overlay">📷 Camera feed will appear here</div>
+    </div>
+    <div class="controls">
+      <button class="btn btn-start" id="cam-btn" onclick="toggleCamera()">🎥 Start Camera</button>
+    </div>
+    <div class="status-bar" id="status-bar">
+      <div class="s-dot"></div>
+      <span id="status-text">Waiting...</span>
+    </div>
+  </div>
+
+  <div class="alerts-panel">
+    <h2>🚨 Threat Alerts</h2>
+    <div class="a-count" id="alert-count">0 Alerts (this session)</div>
+    <div class="alerts-list" id="alerts-list">
+      <div class="no-alerts">
+        <div class="icon">✅</div>
+        <p>No threats detected</p>
+        <small>System is monitoring in real-time</small>
+      </div>
+    </div>
+    <button class="clear-btn hidden" id="clear-btn" onclick="clearAlerts()">Clear Session Alerts</button>
+  </div>
+</div>
+
+<!-- SEARCH TAB -->
+<div id="tab-search" class="search-page hidden">
+  <div class="search-panel">
+    <div class="search-row">
+      <div class="search-wrap">
+        <span class="s-icon">🔍</span>
+        <input type="text" id="search-input" placeholder="Search logs... e.g. screwdriver, gun, running"
+               oninput="onSearchInput()" onkeydown="if(event.key==='Enter')doSearch()"/>
+        <button class="clear-input" id="clear-input-btn" onclick="clearSearch()" style="display:none">✕</button>
+      </div>
+      <button class="btn btn-search" id="search-btn" onclick="doSearch()" disabled>Search</button>
+    </div>
+
+    <div class="chips" id="chips">
+      <span class="chips-lbl">Time window:</span>
+    </div>
+  </div>
+
+  <div class="quick-tags">
+    <span class="q-lbl">Quick search:</span>
+    <button class="qtag" onclick="quickSearch('gun')">gun</button>
+    <button class="qtag" onclick="quickSearch('knife')">knife</button>
+    <button class="qtag" onclick="quickSearch('screwdriver')">screwdriver</button>
+    <button class="qtag" onclick="quickSearch('running')">running</button>
+    <button class="qtag" onclick="quickSearch('suspicious')">suspicious</button>
+    <button class="qtag" onclick="quickSearch('fire')">fire</button>
+    <button class="qtag" onclick="quickSearch('fighting')">fighting</button>
+    <button class="qtag" onclick="quickSearch('theft')">theft</button>
+  </div>
+
+  <div id="search-results">
+    <div class="empty-state">
+      <div class="empty-icon">📋</div>
+      <p>Search the surveillance log</p>
+      <small id="empty-hint">No logs yet — start the camera to begin logging</small>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ────────────────────────────────────────────
+let ws           = null;
+let stream       = null;
+let captureTimer = null;
+let isStreaming  = false;
+let alerts       = [];
+let searchWindow = 0;
+const WINDOWS    = [
+  {l:"All Time",v:0},{l:"5 min",v:5},{l:"15 min",v:15},
+  {l:"30 min",v:30},{l:"1 hr",v:60},{l:"3 hrs",v:180},{l:"24 hrs",v:1440}
+];
+
+// ── Init ─────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  buildChips();
+  fetchStats();
+  setInterval(fetchStats, 10000);
+});
+
+function buildChips(){
+  const wrap = document.getElementById('chips');
+  WINDOWS.forEach(w => {
+    const btn = document.createElement('button');
+    btn.className = 'chip' + (w.v===0?' active':'');
+    btn.textContent = w.l;
+    btn.onclick = () => {
+      searchWindow = w.v;
+      wrap.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));
+      btn.classList.add('active');
+    };
+    wrap.appendChild(btn);
+  });
+}
+
+// ── Stats ─────────────────────────────────────────────
+function fetchStats(){
+  fetch('/api/logs/stats')
+    .then(r=>r.json())
+    .then(d=>{
+      document.getElementById('stat-total').textContent   = d.total;
+      document.getElementById('stat-threats').textContent = d.threats;
+      document.getElementById('stat-safe').textContent    = d.normal;
+      document.getElementById('tab-count').textContent    = d.total;
+      document.getElementById('empty-hint').textContent   =
+        d.total > 0
+          ? `${d.total} entries logged (${d.threats} threats)`
+          : 'No logs yet — start the camera to begin logging';
+    })
+    .catch(()=>{});
+}
+
+// ── Tab switch ────────────────────────────────────────
+function switchTab(name, el){
+  document.getElementById('tab-live').classList.toggle('hidden',   name!=='live');
+  document.getElementById('tab-search').classList.toggle('hidden', name!=='search');
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  el.classList.add('active');
+}
+
+// ── Camera ────────────────────────────────────────────
+async function toggleCamera(){
+  isStreaming ? stopCamera() : await startCamera();
+}
+
+async function startCamera(){
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({video:{width:640,height:480}});
+    document.getElementById('video').srcObject = stream;
+
+    ws = new WebSocket(`ws://${location.host}/ws/camera`);
+
+    ws.onopen = () => {
+      setConn('connected','Live');
+      isStreaming = true;
+      document.getElementById('cam-btn').textContent = '⏹ Stop Camera';
+      document.getElementById('cam-btn').className   = 'btn btn-stop';
+      document.getElementById('vid-overlay').style.display = 'none';
+      document.getElementById('status-bar').classList.add('active');
+      startCapture();
+    };
+
+    ws.onmessage = e => {
+      const r = JSON.parse(e.data);
+      document.getElementById('status-text').textContent = r.description || '…';
+
+      if(r.processed_frame){
+        const img = new Image();
+        img.onload = () => {
+          const ctx = document.getElementById('canvas').getContext('2d');
+          ctx.drawImage(img, 0, 0, 640, 480);
+        };
+        img.src = 'data:image/jpeg;base64,' + r.processed_frame;
+      }
+
+      if(r.is_threat) addAlert(r);
+      fetchStats();
+    };
+
+    ws.onerror = () => setConn('error','Error');
+    ws.onclose = () => setConn('','Offline');
+
+  } catch(e){
+    alert('Camera access denied. Please allow camera permissions.');
+  }
+}
+
+function stopCamera(){
+  stream?.getTracks().forEach(t=>t.stop());
+  ws?.close();
+  clearInterval(captureTimer);
+
+  isStreaming = false;
+  document.getElementById('cam-btn').textContent = '🎥 Start Camera';
+  document.getElementById('cam-btn').className   = 'btn btn-start';
+  document.getElementById('vid-overlay').style.display = 'flex';
+  document.getElementById('status-bar').classList.remove('active');
+  document.getElementById('status-text').textContent = 'Stopped';
+
+  const ctx = document.getElementById('canvas').getContext('2d');
+  ctx.clearRect(0,0,640,480);
+}
+
+function startCapture(){
+  const offscreen = document.createElement('canvas');
+  const ctx       = offscreen.getContext('2d');
+  const vid       = document.getElementById('video');
+
+  captureTimer = setInterval(()=>{
+    if(!ws || ws.readyState !== WebSocket.OPEN) return;
+    offscreen.width  = vid.videoWidth  || 640;
+    offscreen.height = vid.videoHeight || 480;
+    ctx.drawImage(vid,0,0);
+    offscreen.toBlob(blob=>{
+      const reader = new FileReader();
+      reader.onloadend = () => ws.send(JSON.stringify({
+        frame:     reader.result.split(',')[1],
+        timestamp: new Date().toISOString()
+      }));
+      reader.readAsDataURL(blob);
+    },'image/jpeg',0.7);
+  },1000);
+}
+
+function setConn(cls, txt){
+  const b = document.getElementById('conn-badge');
+  b.className = 'badge ' + cls;
+  document.getElementById('conn-text').textContent = txt;
+}
+
+// ── Alerts ────────────────────────────────────────────
+function addAlert(r){
+  const ft = new Date(r.frame_timestamp);
+  const at = new Date(r.analysis_timestamp);
+
+  alerts.unshift({
+    desc:    r.description,
+    fDate:   ft.toLocaleDateString('en-US',{month:'short',day:'numeric'}),
+    fTime:   ft.toLocaleTimeString('en-US',{hour12:false}),
+    aTime:   at.toLocaleTimeString('en-US',{hour12:false}),
+    fts:     r.frame_timestamp
+  });
+  if(alerts.length>20) alerts.pop();
+  renderAlerts();
+}
+
+function clearAlerts(){
+  alerts = [];
+  renderAlerts();
+}
+
+function renderAlerts(){
+  const list = document.getElementById('alerts-list');
+  const cnt  = document.getElementById('alert-count');
+  const btn  = document.getElementById('clear-btn');
+
+  cnt.textContent = `${alerts.length} Alert${alerts.length!==1?'s':''} (this session)`;
+  btn.classList.toggle('hidden', alerts.length===0);
+
+  if(alerts.length===0){
+    list.innerHTML = `
+      <div class="no-alerts">
+        <div class="icon">✅</div>
+        <p>No threats detected</p>
+        <small>System is monitoring in real-time</small>
+      </div>`;
+    return;
+  }
+
+  list.innerHTML = alerts.map(a=>`
+    <div class="alert-card">
+      <div class="a-header">
+        <div class="a-date">${a.fDate}</div>
+        <button class="copy-btn" onclick="copyTs('${a.fts}')">📋 Copy</button>
+      </div>
+      <div class="a-times">
+        <div class="a-time">
+          <span class="t-lbl">📹 Captured</span>
+          <span class="t-val">${a.fTime}</span>
+        </div>
+        <div class="a-time">
+          <span class="t-lbl">🚨 Detected</span>
+          <span class="t-val">${a.aTime}</span>
+        </div>
+      </div>
+      <div class="a-desc">${a.desc}</div>
+    </div>
+  `).join('');
+}
+
+// ── Search ────────────────────────────────────────────
+function onSearchInput(){
+  const val = document.getElementById('search-input').value;
+  document.getElementById('search-btn').disabled     = !val.trim();
+  document.getElementById('clear-input-btn').style.display = val ? 'block' : 'none';
+}
+
+function clearSearch(){
+  document.getElementById('search-input').value = '';
+  document.getElementById('search-btn').disabled = true;
+  document.getElementById('clear-input-btn').style.display = 'none';
+  document.getElementById('search-results').innerHTML = `
+    <div class="empty-state">
+      <div class="empty-icon">📋</div>
+      <p>Search the surveillance log</p>
+      <small id="empty-hint"></small>
+    </div>`;
+  fetchStats();
+}
+
+function quickSearch(q){
+  document.getElementById('search-input').value = q;
+  onSearchInput();
+  doSearch();
+}
+
+async function doSearch(){
+  const q = document.getElementById('search-input').value.trim();
+  if(!q) return;
+
+  const res = document.getElementById('search-results');
+  res.innerHTML = `
+    <div class="empty-state">
+      <div class="spinner"></div>
+      <p>Searching logs...</p>
+    </div>`;
+
+  try{
+    const r    = await fetch(`/api/logs/search?q=${encodeURIComponent(q)}&window=${searchWindow}`);
+    const data = await r.json();
+    renderResults(data);
+  } catch(e){
+    res.innerHTML = `<div class="empty-state"><p>Search failed — is backend running?</p></div>`;
+  }
+}
+
+function renderResults(data){
+  const res = document.getElementById('search-results');
+
+  let html = `<div class="results-meta">`;
+  if(data.count>0){
+    html += `Found <strong>${data.count}</strong> result${data.count!==1?'s':''} for
+             <strong>"${esc(data.query)}"</strong>`;
+    if(data.window_minutes>0) html += ` in last <strong>${data.window_minutes} min</strong>`;
+  } else {
+    html += `No results for <strong>"${esc(data.query)}"</strong>`;
+  }
+  html += `</div>`;
+
+  if(data.count===0){
+    html += `<div class="empty-state">
+      <div class="empty-icon">🔎</div>
+      <p>No matches found</p>
+      <small>Try a different keyword or expand the time window</small>
+    </div>`;
+  } else {
+    data.results.forEach(e=>{
+      const ft   = new Date(e.frame_timestamp);
+      const date = ft.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
+      const time = ft.toLocaleTimeString('en-US',{hour12:false});
+      const desc = highlight(esc(e.description), esc(data.query));
+      const cls  = e.is_threat ? 'threat' : 'safe';
+
+      html += `
+        <div class="log-entry ${cls}">
+          <div class="log-icon">${e.is_threat?'🚨':'✅'}</div>
+          <div class="log-body">
+            <div class="log-desc">${desc}</div>
+            <div class="log-meta">
+              <span class="log-date">📅 ${date}</span>
+              <span class="log-time">🕐 ${time}</span>
+              ${e.frames_analyzed?`<span class="log-frames">🎞 ${e.frames_analyzed} frames</span>`:''}
+              <span class="log-badge ${cls}">${e.is_threat?'THREAT':'SAFE'}</span>
+            </div>
+          </div>
+          <button class="copy-sm" onclick="copyTs('${e.frame_timestamp}')" title="Copy timestamp">📋</button>
+        </div>`;
+    });
+  }
+
+  res.innerHTML = html;
+}
+
+// ── Helpers ───────────────────────────────────────────
+function copyTs(ts){
+  navigator.clipboard.writeText(ts)
+    .then(()=>alert('Timestamp copied!\nUse this to find the incident in camera footage.'))
+    .catch(()=>{});
+}
+
+function esc(s){
+  return String(s)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+
+function highlight(text, query){
+  if(!query) return text;
+  return text.replace(new RegExp(`(${query})`, 'gi'), '<mark>$1</mark>');
+}
+</script>
+</body>
+</html>

@@ -1,58 +1,62 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 import cv2, torch, base64, json, asyncio, gc
 from PIL import Image
 import numpy as np
 from collections import deque
-from datetime import datetime
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
+from datetime import datetime, timedelta
+from pathlib import Path
 from dotenv import load_dotenv
 import os
-from transformers import AutoModelForImageTextToText, AutoProcessor
-from qwen_vl_utils import process_vision_info
-
-
 
 load_dotenv()
 os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN", "")
 
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ── Serve static folder ────────────────────────────────
+Path("static").mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/")
+async def root():
+    return FileResponse("static/index.html")
+
+
 # ── GPU Memory Config ──────────────────────────────────
-# GPU 0: half used by other user → only use 7GB of its ~8GB free
-# GPU 1: fully free             → use 15GB (leave 1GB headroom)
 MAX_MEMORY = {
-    0: "4GiB",   # Conservative — other user is on this GPU
-    1: "15GiB",  # Primary GPU for this process
+    0: "7GiB",
+    1: "15GiB",
 }
 
 print("Loading Qwen3-VL-8B...")
-print(f"  GPU 0 allocation : 4GB  (shared, partial)")
-print(f"  GPU 1 allocation : 15GB (dedicated)")
-
-# ── Load ──────────────────────────────────────────────
 MODEL_ID  = "Qwen/Qwen3-VL-8B-Instruct"
 processor = AutoProcessor.from_pretrained(MODEL_ID)
 
-model = AutoModelForImageTextToText.from_pretrained(
+model = Qwen3VLForConditionalGeneration.from_pretrained(
     MODEL_ID,
-    dtype=torch.bfloat16,
+    torch_dtype=torch.bfloat16,
     device_map="auto",
-    max_memory={0: "4GiB", 1: "15GiB"},
-    # attn_implementation="flash_attention_2"
+    max_memory=MAX_MEMORY,
+    attn_implementation="sdpa"
 )
 model.eval()
 
-# Report actual allocation
 print("✓ Qwen3-VL-8B loaded")
-print(f"  GPU 0 used : {torch.cuda.memory_allocated(0)/1e9:.2f}GB / 4GB reserved")
-print(f"  GPU 1 used : {torch.cuda.memory_allocated(1)/1e9:.2f}GB / 15GB reserved")
+print(f"  GPU 0: {torch.cuda.memory_allocated(0)/1e9:.2f}GB / 7GB reserved")
+print(f"  GPU 1: {torch.cuda.memory_allocated(1)/1e9:.2f}GB / 15GB reserved")
 
 THREAT_KEYWORDS = [
     'gun', 'weapon', 'knife', 'axe', 'armed',
@@ -66,21 +70,20 @@ THREAT_KEYWORDS = [
     'dancing', 'erratic', 'flailing'
 ]
 
-# ── Config: Tuned for ~22GB usable VRAM ───────────────
-# Full 32GB → 6 frames, but with shared GPU0 use 4 frames
-BUFFER_SIZE = 4       # Safe on 22GB usable
+# ── Config ─────────────────────────────────────────────
+BUFFER_SIZE = 4
 FRAME_W     = 640
 FRAME_H     = 480
+LOG_FILE    = Path("surveillance_log.jsonl")
 
 frame_buffer    = deque(maxlen=BUFFER_SIZE)
 ts_buffer       = deque(maxlen=BUFFER_SIZE)
 buffer_lock     = asyncio.Lock()
 new_frame_event = asyncio.Event()
+prev_gray       = None
 
-prev_gray = None
 
-
-# ── Optical Flow Overlay ───────────────────────────────
+# ── Optical Flow ───────────────────────────────────────
 def add_motion_overlay(bgr):
     global prev_gray
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -93,7 +96,7 @@ def add_motion_overlay(bgr):
         iterations=3, poly_n=5, poly_sigma=1.2, flags=0
     )
     overlay = bgr.copy()
-    h, w    = overlay.shape[:2]
+    h, w = overlay.shape[:2]
     for y in range(0, h, 20):
         for x in range(0, w, 20):
             fx, fy = flow[y, x]
@@ -112,57 +115,43 @@ def frame_to_base64(bgr) -> str:
     return base64.b64encode(buf).decode('utf-8')
 
 
-# ── Multi-Frame Inference ──────────────────────────────
+# ── Inference ──────────────────────────────────────────
 def analyze_multi(pil_frames: list, timestamp: str) -> dict:
     n = len(pil_frames)
-
     content = [
-        {
-            "type": "image",
-            "image": f,
-            "min_pixels": 256*28*28,
-            "max_pixels": 1280*28*28
-        }
+        {"type": "image", "image": f,
+         "min_pixels": 256*28*28,
+         "max_pixels": 1280*28*28}
         for f in pil_frames
     ]
     content.append({
         "type": "text",
         "text": (
-            f"These are {n} consecutive CCTV security camera frames "
-            "captured 1 second apart. Green arrows show motion direction. "
-            "In ONE sentence, describe exactly what the person is doing — "
-            "focus on actions, movement, and any object they are holding or using. "
-            "Mention any jerking, aggressive, or suspicious behavior."
+            f"These are {n} consecutive CCTV frames 1 second apart. "
+            "Green arrows show motion. In ONE sentence describe what the "
+            "person is doing — focus on actions, movement, and any object "
+            "they are holding. Mention any aggressive or suspicious behavior."
         )
     })
 
     messages = [{"role": "user", "content": content}]
-
-    text = processor.apply_chat_template(
+    text     = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
     image_inputs, video_inputs = process_vision_info(messages)
-
     inputs = processor(
-        text=[text],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt"
+        text=[text], images=image_inputs, videos=video_inputs,
+        padding=True, return_tensors="pt"
     ).to(model.device)
 
     with torch.no_grad():
         gen_ids = model.generate(
-            **inputs,
-            max_new_tokens=70,
-            do_sample=False,
-            temperature=None,
-            top_p=None
+            **inputs, max_new_tokens=70,
+            do_sample=False, temperature=None, top_p=None
         )
 
     trimmed = [o[len(i):] for i, o in zip(inputs.input_ids, gen_ids)]
     output  = processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
-
     if '.' in output:
         output = output.split('.')[0] + '.'
 
@@ -176,46 +165,17 @@ def analyze_multi(pil_frames: list, timestamp: str) -> dict:
         "description": output,
         "is_threat": is_threat,
         "frames_analyzed": n,
-        "mode": "multi_frame",
         "frame_timestamp": timestamp,
         "analysis_timestamp": datetime.now().isoformat()
     }
 
 
-# ── Routes ─────────────────────────────────────────────
-@app.get("/")
-async def root():
-    return {
-        "status"      : "Qwen3-VL-8B Multi-Frame Running",
-        "model"       : MODEL_ID,
-        "buffer_size" : BUFFER_SIZE,
-        "gpu_0_used"  : f"{torch.cuda.memory_allocated(0)/1e9:.2f}GB / 4GB reserved",
-        "gpu_1_used"  : f"{torch.cuda.memory_allocated(1)/1e9:.2f}GB / 15GB reserved",
-    }
-
-
-@app.get("/api/cameras")
-async def get_cameras():
-    available = []
-    for i in range(5):
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            ret, _ = cap.read()
-            if ret:
-                available.append({"id": i, "name": f"Camera {i}"})
-            cap.release()
-    return {"cameras": available}
-
-
+# ── Log Routes ─────────────────────────────────────────
 @app.get("/api/logs/search")
 async def search_logs(
     q: str = Query(...),
     window: int = Query(0)
 ):
-    from pathlib import Path
-    from datetime import timedelta
-
-    LOG_FILE = Path("surveillance_log.jsonl")
     if not LOG_FILE.exists():
         return {"query": q, "window_minutes": window, "count": 0, "results": []}
 
@@ -232,7 +192,6 @@ async def search_logs(
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-
             if window > 0:
                 try:
                     entry_time = datetime.fromisoformat(entry["frame_timestamp"])
@@ -240,25 +199,19 @@ async def search_logs(
                         continue
                 except Exception:
                     continue
-
             if query_lower in entry.get("description", "").lower():
                 results.append(entry)
 
     return {
-        "query"          : q,
-        "window_minutes" : window,
-        "count"          : len(results),
-        "results"        : list(reversed(results))
+        "query": q, "window_minutes": window,
+        "count": len(results), "results": list(reversed(results))
     }
 
 
 @app.get("/api/logs/stats")
 async def log_stats():
-    from pathlib import Path
-    LOG_FILE = Path("surveillance_log.jsonl")
     if not LOG_FILE.exists():
         return {"total": 0, "threats": 0, "normal": 0}
-
     total = threats = 0
     with open(LOG_FILE, "r", encoding="utf-8") as f:
         for line in f:
@@ -269,13 +222,24 @@ async def log_stats():
                     threats += 1
             except Exception:
                 continue
-
     return {"total": total, "threats": threats, "normal": total - threats}
 
 
-# ── WebSocket Tasks ────────────────────────────────────
+@app.get("/api/cameras")
+async def get_cameras():
+    available = []
+    for i in range(5):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            ret, _ = cap.read()
+            if ret:
+                available.append({"id": i, "name": f"Camera {i}"})
+            cap.release()
+    return {"cameras": available}
+
+
+# ── WebSocket ──────────────────────────────────────────
 async def receiver(ws: WebSocket):
-    """Receives frames, applies motion overlay, pushes to buffer"""
     while True:
         data = await ws.receive_text()
         try:
@@ -297,13 +261,11 @@ async def receiver(ws: WebSocket):
                 ts_buffer.append(ts)
 
             new_frame_event.set()
-
         except Exception as e:
-            print(f"⚠️ Receiver error: {e}")
+            print(f"⚠️ Receiver: {e}")
 
 
 async def processor_loop(ws: WebSocket):
-    """Processes latest buffer snapshot on each new frame signal"""
     while True:
         await new_frame_event.wait()
         new_frame_event.clear()
@@ -315,7 +277,7 @@ async def processor_loop(ws: WebSocket):
             latest_ts  = list(ts_buffer)[-1]
             latest_bgr = cv2.cvtColor(np.array(frames[-1]), cv2.COLOR_RGB2BGR)
 
-        print(f"🔍 Analyzing {len(frames)} frames | "
+        print(f"🔍 {len(frames)} frames | "
               f"GPU0: {torch.cuda.memory_allocated(0)/1e9:.1f}GB | "
               f"GPU1: {torch.cuda.memory_allocated(1)/1e9:.1f}GB")
 
@@ -325,16 +287,14 @@ async def processor_loop(ws: WebSocket):
                 None, analyze_multi, frames, latest_ts
             )
 
-            # Write to log file
-            log_entry = {
-                "frame_timestamp"    : result["frame_timestamp"],
-                "analysis_timestamp" : result["analysis_timestamp"],
-                "description"        : result["description"],
-                "is_threat"          : result["is_threat"],
-                "frames_analyzed"    : result["frames_analyzed"]
-            }
-            with open("surveillance_log.jsonl", "a", encoding="utf-8") as f:
-                f.write(json.dumps(log_entry) + "\n")
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "frame_timestamp"    : result["frame_timestamp"],
+                    "analysis_timestamp" : result["analysis_timestamp"],
+                    "description"        : result["description"],
+                    "is_threat"          : result["is_threat"],
+                    "frames_analyzed"    : result["frames_analyzed"]
+                }) + "\n")
 
             result["processed_frame"] = frame_to_base64(latest_bgr)
             await ws.send_json(result)
@@ -343,18 +303,12 @@ async def processor_loop(ws: WebSocket):
             print(f"{icon} [{latest_ts}] {result['description']}")
 
         except torch.cuda.OutOfMemoryError:
-            print("⚠️ OOM — clearing cache and reducing buffer")
             torch.cuda.empty_cache()
             gc.collect()
-            # Auto-reduce buffer on OOM
-            global BUFFER_SIZE
-            if BUFFER_SIZE > 2:
-                BUFFER_SIZE = BUFFER_SIZE - 1
-                frame_buffer = deque(maxlen=BUFFER_SIZE)
-                print(f"  Buffer reduced to {BUFFER_SIZE} frames")
+            print("⚠️ OOM — reduce BUFFER_SIZE in config")
 
         except Exception as e:
-            print(f"⚠️ Inference error: {e}")
+            print(f"⚠️ Inference: {e}")
 
 
 @app.websocket("/ws/camera")
@@ -368,17 +322,16 @@ async def ws_endpoint(ws: WebSocket):
     new_frame_event.clear()
 
     await ws.send_json({
-        "description"        : f"Qwen3-VL-8B Ready — {BUFFER_SIZE} frame buffer.",
-        "is_threat"          : False,
-        "frames_analyzed"    : 0,
-        "frame_timestamp"    : datetime.now().isoformat(),
-        "analysis_timestamp" : datetime.now().isoformat()
+        "description": f"Qwen3-VL-8B Ready — {BUFFER_SIZE} frame buffer.",
+        "is_threat": False, "frames_analyzed": 0,
+        "frame_timestamp": datetime.now().isoformat(),
+        "analysis_timestamp": datetime.now().isoformat()
     })
 
     try:
         await asyncio.gather(receiver(ws), processor_loop(ws))
     except WebSocketDisconnect:
-        print("✗ Client disconnected")
+        print("✗ Disconnected")
     except Exception as e:
         print(f"✗ Error: {e}")
 
