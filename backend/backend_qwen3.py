@@ -6,7 +6,6 @@ from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 from datetime import datetime
 from pathlib import Path
-from collections import deque
 from dotenv import load_dotenv
 import json, gc, os, textwrap, threading
 
@@ -15,11 +14,9 @@ os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN", "")
 
 # ── Config ─────────────────────────────────────────────
 CAMERA_INDEX = 0
-BUFFER_SIZE  = 1
-FRAME_W      = 480
-FRAME_H      = 360
+FRAME_W      = 854     # 480p widescreen — decent + fast
+FRAME_H      = 480
 LOG_FILE     = Path("surveillance_log.jsonl")
-
 MAX_MEMORY   = {0: "4GiB", 1: "15GiB"}
 
 THREAT_KEYWORDS = [
@@ -30,7 +27,7 @@ THREAT_KEYWORDS = [
     'aggressive', 'violence', 'fire', 'explosion',
     'screwdriver', 'hammer', 'bat', 'crowbar',
     'swinging', 'lunging', 'striking', 'stabbing',
-    'running', 'chasing', 'jerking', 'suspicious'
+    'running', 'chasing', 'jerking', 'suspicious', 'cable', 'wire','pen'
 ]
 
 # ── Load Model ─────────────────────────────────────────
@@ -39,18 +36,17 @@ MODEL_ID  = "Qwen/Qwen3-VL-8B-Instruct"
 processor = AutoProcessor.from_pretrained(MODEL_ID)
 model     = Qwen3VLForConditionalGeneration.from_pretrained(
     MODEL_ID,
-    dtype=torch.bfloat16,
+    torch_dtype=torch.bfloat16,
     device_map="auto",
     max_memory=MAX_MEMORY,
     attn_implementation="sdpa"
 )
 model.eval()
 print(f"✓ Model loaded")
-print(f"  GPU 0: {torch.cuda.memory_allocated(0)/1e9:.2f}GB")
-print(f"  GPU 1: {torch.cuda.memory_allocated(1)/1e9:.2f}GB")
+print(f"  GPU 0 : {torch.cuda.memory_allocated(0)/1e9:.2f} GB")
+print(f"  GPU 1 : {torch.cuda.memory_allocated(1)/1e9:.2f} GB")
 
 # ── Shared State ───────────────────────────────────────
-frame_buffer = deque(maxlen=BUFFER_SIZE)
 result_state = {
     "description" : "Starting...",
     "is_threat"   : False,
@@ -59,25 +55,29 @@ result_state = {
 inferring = threading.Event()
 
 
-# ── Inference Thread ───────────────────────────────────
-def run_inference(frames: list, timestamp: str):
+# ── Inference (single frame) ───────────────────────────
+def run_inference(pil_img: Image.Image, timestamp: str):
     try:
-        n       = len(frames)
-        content = [
-            {"type": "image", "image": f,
-             "min_pixels": 256*28*28,
-             "max_pixels": 720*28*28}
-            for f in frames
-        ]
-        content.append({
-            "type": "text",
-            "text": (
-                f"As a CCTV, Explain what is happening in these {n} frames in one sentence"
-            )
-        })
+        messages = [{
+            "role": "user",
+            "content": [
+                {
+                    "type"       : "image",
+                    "image"      : pil_img,
+                    "min_pixels" : 256 * 28 * 28,
+                    "max_pixels" : 1280 * 28 * 28
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "This is a CCTV frame. In ONE sentence describe "
+                        "exactly what is happening — what the person is doing, "
+                    )
+                }
+            ]
+        }]
 
-        messages = [{"role": "user", "content": content}]
-        text     = processor.apply_chat_template(
+        text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
         image_inputs, video_inputs = process_vision_info(messages)
@@ -88,12 +88,17 @@ def run_inference(frames: list, timestamp: str):
 
         with torch.no_grad():
             gen_ids = model.generate(
-                **inputs, max_new_tokens=80,
-                do_sample=False, temperature=None, top_p=None
+                **inputs,
+                max_new_tokens=60,
+                do_sample=False,
+                temperature=None,
+                top_p=None
             )
 
         trimmed = [o[len(i):] for i, o in zip(inputs.input_ids, gen_ids)]
-        output  = processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
+        output  = processor.batch_decode(
+            trimmed, skip_special_tokens=True
+        )[0].strip()
 
         if '.' in output:
             output = output.split('.')[0] + '.'
@@ -109,8 +114,7 @@ def run_inference(frames: list, timestamp: str):
                 "frame_timestamp"    : timestamp,
                 "analysis_timestamp" : datetime.now().isoformat(),
                 "description"        : output,
-                "is_threat"          : is_threat,
-                "frames_analyzed"    : n
+                "is_threat"          : is_threat
             }) + "\n")
 
         icon = "🚨 THREAT" if is_threat else "✅"
@@ -131,43 +135,36 @@ def draw_overlay(frame, description, is_threat, fps):
     h, w = frame.shape[:2]
 
     # Top bar
-    cv2.rectangle(frame, (0, 0), (w, 36), (30, 30, 30), -1)
-
-    dot_color = (0, 100, 255) if inferring.is_set() else (0, 255, 100)
+    cv2.rectangle(frame, (0, 0), (w, 36), (25, 25, 25), -1)
+    dot_color = (0, 100, 255) if inferring.is_set() else (0, 220, 90)
     cv2.circle(frame, (18, 18), 7, dot_color, -1)
-
     status = "Analyzing..." if inferring.is_set() else "Ready"
     cv2.putText(frame, status, (32, 24),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-
     fps_txt  = f"FPS: {fps:.1f}"
     fps_size = cv2.getTextSize(fps_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
     cv2.putText(frame, fps_txt, (w - fps_size[0] - 10, 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (140, 140, 140), 1)
 
-    # Bottom description bar
-    bar_h   = 80
-    bar_top = h - bar_h
+    # Bottom bar
+    bar_top = h - 80
     bar_bg  = (50, 15, 15) if is_threat else (15, 35, 15)
-    border  = (0, 50, 220) if is_threat else (0, 180, 80)
-
+    border  = (0, 60, 220)  if is_threat else (0, 180, 80)
     cv2.rectangle(frame, (0, bar_top), (w, h), bar_bg, -1)
     cv2.line(frame, (0, bar_top), (w, bar_top), border, 2)
 
-    label     = "THREAT" if is_threat else "SAFE"
-    lbl_color = (0, 50, 200) if is_threat else (0, 130, 50)
-    lbl_w     = 80 if is_threat else 58
-    cv2.rectangle(frame, (8, bar_top + 6), (lbl_w, bar_top + 28), lbl_color, -1)
+    label   = "THREAT" if is_threat else "SAFE"
+    lbl_bg  = (0, 50, 200)  if is_threat else (0, 130, 50)
+    lbl_end = 82            if is_threat else 60
+    cv2.rectangle(frame, (8, bar_top + 6), (lbl_end, bar_top + 28), lbl_bg, -1)
     cv2.putText(frame, label, (12, bar_top + 22),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1)
 
-    # Description text (2 lines max)
     txt_color = (180, 180, 255) if is_threat else (180, 255, 180)
-    for i, line in enumerate(textwrap.wrap(description, width=85)[:2]):
+    for i, line in enumerate(textwrap.wrap(description, width=95)[:2]):
         cv2.putText(frame, line, (10, bar_top + 46 + i * 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.50, txt_color, 1)
 
-    # Timestamp bottom-right
     ts      = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
     ts_size = cv2.getTextSize(ts, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)[0]
     cv2.putText(frame, ts, (w - ts_size[0] - 8, h - 6),
@@ -176,7 +173,7 @@ def draw_overlay(frame, description, is_threat, fps):
     return frame
 
 
-# ── Main Loop ──────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────
 def main():
     cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_W)
@@ -186,15 +183,18 @@ def main():
         print(f"❌ Cannot open camera {CAMERA_INDEX}")
         return
 
-    print("\n✓ Camera opened — Press Q to quit\n")
+    print(f"\n✓ Camera opened at {FRAME_W}x{FRAME_H}")
+    print("  Press Q to quit\n")
+
     cv2.namedWindow("CCTV — Qwen3-VL-8B", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("CCTV — Qwen3-VL-8B", FRAME_W, FRAME_H)
 
-    frame_count = 0
-    last_infer  = 0
-    fps_counter = 0
-    fps_timer   = cv2.getTickCount()
-    fps         = 0.0
+    fps_counter  = 0
+    fps_timer    = cv2.getTickCount()
+    fps          = 0.0
+    last_trigger = 0.0   # time.time() of last inference trigger
+
+    import time
 
     while True:
         ret, frame = cap.read()
@@ -202,9 +202,7 @@ def main():
             print("⚠️ Frame grab failed")
             break
 
-        frame_count += 1
-
-        # FPS
+        # FPS counter
         fps_counter += 1
         elapsed = (cv2.getTickCount() - fps_timer) / cv2.getTickFrequency()
         if elapsed >= 1.0:
@@ -212,29 +210,33 @@ def main():
             fps_counter = 0
             fps_timer   = cv2.getTickCount()
 
-        # Add raw frame to buffer
-        resized = cv2.resize(frame, (FRAME_W, FRAME_H))
-        pil_img = Image.fromarray(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
-        frame_buffer.append(pil_img)
+        now = time.time()
 
-        # Trigger inference every BUFFER_SIZE frames when free
-        if (frame_count - last_infer >= BUFFER_SIZE) and not inferring.is_set():
-            last_infer  = frame_count
-            frames_snap = list(frame_buffer)
-            timestamp   = datetime.now().isoformat()
+        # Trigger inference once per second when free
+        if (now - last_trigger >= 1.0) and not inferring.is_set():
+            last_trigger = now
+            resized      = cv2.resize(frame, (FRAME_W, FRAME_H))
+            pil_img      = Image.fromarray(
+                cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            )
+            timestamp = datetime.now().isoformat()
             inferring.set()
             threading.Thread(
                 target=run_inference,
-                args=(frames_snap, timestamp),
+                args=(pil_img, timestamp),
                 daemon=True
             ).start()
 
-        # Read latest result and draw
+        # Read latest result
         with result_state["lock"]:
             desc      = result_state["description"]
             is_threat = result_state["is_threat"]
 
-        display = draw_overlay(resized.copy(), desc, is_threat, fps)
+        # Draw and show
+        display = draw_overlay(
+            cv2.resize(frame, (FRAME_W, FRAME_H)),
+            desc, is_threat, fps
+        )
         cv2.imshow("CCTV — Qwen3-VL-8B", display)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
