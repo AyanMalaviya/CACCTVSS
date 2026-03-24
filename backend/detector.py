@@ -5,23 +5,33 @@ from ultralytics import YOLO
 from PIL import Image
 from datetime import datetime
 from pathlib import Path
-from huggingface_hub import hf_hub_download, list_repo_files
+from huggingface_hub import hf_hub_download
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-YOLO_MODEL_PATH    = "yolo11l.pt"          # upgraded from yolo26n → YOLO11l
-WEAPON_MODEL_PATH  = "yolov8m.pt"          # upgraded from n → m for better accuracy
-VLM_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
-WEAPON_CLASSES     = {}
+YOLO_MODEL_PATH = "yolo26n.pt"
+VLM_MODEL_ID    = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
+
 PROXIMITY_DURATION = 2.5
-VLM_COOLDOWN_SEC   = 3.0
 RED_HOLD_SEC       = 6.0
 RED_CONFIDENCE     = {"medium", "high"}
 
-GPU_YOLO = "cuda:0"    # all YOLO / video processing
-GPU_VLM  = "cuda:1"    # VLM exclusively — never shares with YOLO
+# ── Threat model config ───────────────────────────────────────────────────────
+# Subh775/Threat-Detection-YOLOv8n classes:
+#   0: Bike  1: Gun  2: Explosive  3: Grenade  4: Knife
+# We only activate Gun and Knife — ignore Bike/Explosive/Grenade
+THREAT_MODEL_REPO     = "Subh775/Threat-Detection-YOLOv8n"
+THREAT_MODEL_FILENAME = "weights/best.pt"
+ACTIVE_THREAT_NAMES   = {"gun", "knife"}   # lowercase match
+threat_classes: dict  = {}   # filled after load: {cls_id: label}
+
+# Colour per weapon in overlay
+WEAPON_COLORS = {
+    "gun":   (128, 0, 255),   # purple
+    "knife": (0,   0, 255),   # red
+}
 
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
@@ -45,6 +55,7 @@ state = {
     "detection_mode":    "both",
     "vlm_interval":      15.0,
     "mode_switching":    False,
+    "custom_prompt":     "",
 }
 
 state_lock = threading.Lock()
@@ -52,192 +63,137 @@ state_lock = threading.Lock()
 
 # ── Model Loaders ─────────────────────────────────────────────────────────────
 def load_yolo():
-    log.info(f"Loading YOLO11l on {GPU_YOLO}...")
+    log.info("Loading YOLO26n...")
     model = YOLO(YOLO_MODEL_PATH)
-    model.to(GPU_YOLO)
-    model.model.half()
-    # torch.compile for ~20-30% faster inference on A4000
+    log.info(f"YOLO26n ready — {len(model.names)} classes.")
+    return model
+
+
+def load_threat_model():
+    """
+    Downloads Subh775/Threat-Detection-YOLOv8n.
+    Only activates Gun (cls 1) and Knife (cls 4).
+    Falls back to YOLOv8n COCO knife if download fails.
+    """
+    global threat_classes
     try:
-        model.model = torch.compile(model.model, mode="reduce-overhead")
-        log.info("[YOLO] torch.compile applied ✅")
+        log.info(f"[THREAT] Downloading {THREAT_MODEL_REPO} ...")
+        path  = hf_hub_download(
+            repo_id=THREAT_MODEL_REPO,
+            filename=THREAT_MODEL_FILENAME,
+        )
+        model = YOLO(path)
+        # Only keep classes whose names are in ACTIVE_THREAT_NAMES
+        threat_classes = {
+            cls_id: name
+            for cls_id, name in model.names.items()
+            if name.lower() in ACTIVE_THREAT_NAMES
+        }
+        log.info(
+            f"[THREAT] Loaded. All classes: {model.names} "
+            f"| Active: {threat_classes}"
+        )
+        return model
     except Exception as e:
-        log.warning(f"[YOLO] torch.compile skipped: {e}")
-    log.info(f"YOLO11l ready on {GPU_YOLO} — {len(model.names)} classes.")
-    return model
-
-
-def load_weapon_model():
-    global WEAPON_CLASSES
-    candidates = [
-        "Subh775/Threat-Detection-YOLOv8n",
-        "Subh775/Firearm_Detection_Yolov8n",
-        "Hadi959/weapon-detection-yolov8",
-    ]
-    for repo_id in candidates:
-        try:
-            files    = list(list_repo_files(repo_id))
-            pt_files = [f for f in files if f.endswith(".pt")]
-            if not pt_files:
-                continue
-            filename   = pt_files[0]
-            log.info(f"[WEAPON] Trying {repo_id} / {filename} ...")
-            model_path = hf_hub_download(repo_id=repo_id, filename=filename)
-            model      = YOLO(model_path)
-            model.to(GPU_YOLO)    # ← weapon model always on GPU 0
-            model.model.half()
-            WEAPON_CLASSES = {i: name for i, name in model.names.items()}
-            log.info(f"[WEAPON] Loaded on {GPU_YOLO}. Classes: {list(model.names.values())}")
-            return model
-        except Exception as e:
-            log.warning(f"[WEAPON] {repo_id} failed: {e}. Trying next...")
-
-    log.warning("[WEAPON] Falling back to YOLOv8n COCO.")
-    model = YOLO("yolov8n.pt")
-    model.to(GPU_YOLO)
-    WEAPON_CLASSES = {49: "knife"}
-    return model
+        log.warning(f"[THREAT] Download failed: {e}. Falling back to YOLOv8n COCO.")
+        model          = YOLO("yolov8n.pt")
+        threat_classes = {49: "knife"}   # COCO knife class
+        return model
 
 
 def load_vlm():
     try:
-        from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
-        from qwen_vl_utils import process_vision_info   # must be installed separately
-
-        log.info(f"Loading Qwen3-VL-8B on {GPU_VLM} (8-bit)...")
-
+        from transformers import (
+            AutoProcessor,
+            AutoModelForImageTextToText,
+            BitsAndBytesConfig,
+        )
+        log.info("Loading SmolVLM2-2.2B-Instruct (4-bit)...")
         bnb = BitsAndBytesConfig(
-            load_in_8bit=True,
-            bnb_8bit_compute_dtype=torch.bfloat16,
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
         )
         processor = AutoProcessor.from_pretrained(VLM_MODEL_ID)
         model     = AutoModelForImageTextToText.from_pretrained(
             VLM_MODEL_ID,
             quantization_config=bnb,
-            device_map={"": GPU_VLM},
-            attn_implementation="flash_attention_2",
-            torch_dtype=torch.bfloat16,
+            device_map="cuda",
+            _attn_implementation="eager",
         )
         model.eval()
-        log.info(f"Qwen3-VL-8B ready on {GPU_VLM}.")
+        log.info("SmolVLM2-2.2B ready.")
         return model, processor
     except Exception as e:
-        log.warning(f"Qwen3-VL-8B failed ({e}). Falling back to SmolVLM2...")
-        return _load_smolvlm_fallback()
-
-
-
-def _load_smolvlm_fallback():
-    """SmolVLM2-2.2B at full BF16 — no quantization needed on 16GB."""
-    try:
-        from transformers import AutoProcessor, AutoModelForImageTextToText
-        log.info(f"Loading SmolVLM2-2.2B (BF16, no quantization) on {GPU_VLM}...")
-        processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM2-2.2B-Instruct")
-        model     = AutoModelForImageTextToText.from_pretrained(
-            "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
-            torch_dtype=torch.bfloat16,              # full BF16 — no quantization needed
-            device_map={"": GPU_VLM},
-            _attn_implementation="flash_attention_2",
-        )
-        model.eval()
-        log.info("SmolVLM2-2.2B BF16 fallback ready.")
-        return model, processor
-    except Exception as e:
-        log.warning(f"SmolVLM2 fallback failed ({e}). VLM disabled.")
+        log.warning(f"VLM load failed ({e}). Running YOLO-only mode.")
         return None, None
 
 
-# ── VRAM helpers (per GPU) ────────────────────────────────────────────────────
-def get_vram_usage_pct(device_index: int = 0) -> float:
-    try:
-        reserved = torch.cuda.memory_reserved(device_index)
-        total    = torch.cuda.get_device_properties(device_index).total_memory
-        return (reserved / total) * 100
-    except Exception:
-        return 0.0
-
-
 # ── VLM Prompts ───────────────────────────────────────────────────────────────
-VLM_THREAT_PROMPT = """You are a surveillance AI. Analyze this image for potential threats. Focus on people, their actions, and any objects they hold."""
+VLM_THREAT_PROMPT = """Look at this surveillance image and answer: is there any dangerous or threatening behavior happening?
+
+Answer YES only if you can clearly see one of these:
+- Someone physically attacking or hitting another person
+- Someone breaking a door, window, or barrier by force
+- A person on the ground being hurt or restrained
+
+Answer NO for everything else including:
+- People standing, walking, talking, or sitting
+- People near each other or touching normally
+- Any object not being actively used as a weapon right now
+- Anything you are not completely sure about
+
+Be conservative. If you are not certain, answer NO.
+
+Reply with JSON only:
+{"threat": false, "type": "none", "confidence": "low", "description": "No threat detected"}
+{"threat": true, "type": "fight|intrusion|assault", "confidence": "low|medium|high", "description": "One factual sentence"}"""
+
+PERSON_PROMPT = """Look at this person in the surveillance image.
+
+Write 2 short sentences:
+1. What are they doing right now? (walking, standing, carrying something, using phone, etc.)
+2. What is the single most noticeable thing about them that would help identify them?
+
+Do not mention age. Do not describe full outfit.
+Start sentence 1 with an action verb. Start sentence 2 with a noun.
+Reply with only the 2 sentences."""
+
+SCENE_PROMPT = """Look at this surveillance image and describe what is happening in one sentence.
+Focus on people's actions and any objects they are interacting with.
+Be specific about what you actually see, not what you expect to see.
+Reply with only one sentence."""
+
+COUNT_CHANGE_PROMPT = """The number of people in this camera view just changed.
+Look at the image and describe in one sentence what you now see happening.
+Focus on movement and actions.
+Reply with only one sentence."""
+
 
 # ── Core VLM Inference ────────────────────────────────────────────────────────
-def _qwen_infer(crop_bgr: np.ndarray, prompt: str, vlm_model, processor,
-                max_tokens: int = 80) -> str:
-    from qwen_vl_utils import process_vision_info
-    try:
-        h, w  = crop_bgr.shape[:2]
-        scale = 768 / max(h, w)
-        if scale < 1.0:
-            crop_bgr = cv2.resize(crop_bgr, (int(w * scale), int(h * scale)),
-                                  interpolation=cv2.INTER_AREA)
-        image = Image.fromarray(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
-
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text",  "text":  prompt},
-            ]
-        }]
-
-        # Qwen3-VL — apply_chat_template with tokenize=True + return_dict=True
-        inputs = processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-        )
-        inputs = inputs.to(GPU_VLM)
-
-        with torch.no_grad():
-            out = vlm_model.generate(
-                **inputs,
-                do_sample=True,
-                temperature=0.3,
-                top_p=0.9,
-                max_new_tokens=max_tokens,
-            )
-
-        # Strip input tokens from output — Qwen3-VL standard pattern
-        input_len = inputs["input_ids"].shape[1]
-        result    = processor.batch_decode(
-            out[:, input_len:],
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )[0].strip()
-        return result
-
-    except torch.cuda.OutOfMemoryError:
-        log.error(f"[VLM] OOM on {GPU_VLM}")
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize(GPU_VLM)
-        return ""
-    except Exception as e:
-        log.warning(f"[VLM] Qwen3 inference error: {e}")
-        return ""
-    finally:
-        torch.cuda.empty_cache()
-
-
 def _smolvlm_infer(crop_bgr: np.ndarray, prompt: str, vlm_model, processor,
                    max_tokens: int = 80) -> str:
-    """Inference path for SmolVLM2 fallback."""
+    if vlm_model is None or processor is None:
+        return ""
     try:
         h, w  = crop_bgr.shape[:2]
         scale = 512 / max(h, w)
         if scale < 1.0:
-            crop_bgr = cv2.resize(crop_bgr, (int(w * scale), int(h * scale)),
-                                  interpolation=cv2.INTER_AREA)
-
+            crop_bgr = cv2.resize(
+                crop_bgr, (int(w * scale), int(h * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
         image    = Image.fromarray(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
         messages = [{
-            "role": "user",
-            "content": [{"type": "image"}, {"type": "text", "text": prompt}]
+            "role":    "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": prompt},
+            ],
         }]
         text_prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
         inputs      = processor(
             text=text_prompt, images=[image], return_tensors="pt"
-        ).to(GPU_VLM, dtype=torch.bfloat16)
+        ).to(vlm_model.device, dtype=torch.bfloat16)
 
         with torch.no_grad():
             out = vlm_model.generate(
@@ -255,34 +211,22 @@ def _smolvlm_infer(crop_bgr: np.ndarray, prompt: str, vlm_model, processor,
         return lines[-1] if lines else result
 
     except torch.cuda.OutOfMemoryError:
-        log.error(f"[VLM] OOM on {GPU_VLM}")
+        log.error("[VLM] OOM — clearing VRAM")
         torch.cuda.empty_cache()
-        torch.cuda.synchronize(GPU_VLM)
+        torch.cuda.synchronize()
         return ""
     except Exception as e:
-        log.warning(f"[VLM] SmolVLM inference error: {e}")
+        log.warning(f"[VLM] Inference error: {e}")
         return ""
     finally:
         torch.cuda.empty_cache()
 
 
-# ── Unified infer dispatcher ──────────────────────────────────────────────────
-_vlm_is_qwen = False   # set True after load if Qwen loaded successfully
-
-def vlm_infer(crop_bgr: np.ndarray, prompt: str, vlm_model, processor,
-              max_tokens: int = 80) -> str:
-    if vlm_model is None or processor is None:
-        return ""
-    if _vlm_is_qwen:
-        return _qwen_infer(crop_bgr, prompt, vlm_model, processor, max_tokens)
-    return _smolvlm_infer(crop_bgr, prompt, vlm_model, processor, max_tokens)
-
-
 def run_vlm(crop_bgr: np.ndarray, vlm_model, processor) -> dict:
-    if vlm_model is None:
+    if vlm_model is None or processor is None:
         return {"threat": False, "type": "none", "confidence": "low",
                 "description": "VLM not loaded"}
-    raw = vlm_infer(crop_bgr, VLM_THREAT_PROMPT, vlm_model, processor, max_tokens=100)
+    raw = _smolvlm_infer(crop_bgr, VLM_THREAT_PROMPT, vlm_model, processor, max_tokens=100)
     try:
         js = raw[raw.rfind("{") : raw.rfind("}") + 1]
         return json.loads(js)
@@ -291,25 +235,36 @@ def run_vlm(crop_bgr: np.ndarray, vlm_model, processor) -> dict:
         return {
             "threat":      is_threat,
             "type":        "assault" if is_threat else "none",
-            "confidence":  "medium" if is_threat else "low",
+            "confidence":  "medium"  if is_threat else "low",
             "description": raw[:120],
         }
 
 
 # ── Weapon Inference ──────────────────────────────────────────────────────────
-def run_weapon_inference(weapon_model, frame: np.ndarray) -> tuple:
-    results        = weapon_model(frame, conf=0.65, imgsz=640, verbose=False)
-    detections     = []
-    trigger_reason = None
-    trigger_crop   = None
-    fh, fw         = frame.shape[:2]
-    frame_area     = fh * fw
+def run_weapon_inference(threat_model: YOLO, frame: np.ndarray) -> tuple:
+    """
+    Run Subh775/Threat-Detection-YOLOv8n.
+    Only reports classes in threat_classes (gun + knife).
+    Returns: (detections, trigger_reason, trigger_crop)
+    """
+    if threat_model is None:
+        return [], None, None
+
+    results    = threat_model(frame, conf=0.60, imgsz=640, verbose=False)
+    detections = []
+    fh, fw     = frame.shape[:2]
+    frame_area = fh * fw
 
     for box in results[0].boxes:
         cls_id = int(box.cls[0])
-        conf   = float(box.conf[0])
-        name   = WEAPON_CLASSES.get(cls_id, "weapon")
-        xyxy   = box.xyxy[0].cpu().numpy()
+
+        # Skip classes we don't want (Bike, Explosive, Grenade)
+        if cls_id not in threat_classes:
+            continue
+
+        conf  = float(box.conf[0])
+        label = threat_classes[cls_id]
+        xyxy  = box.xyxy[0].cpu().numpy()
 
         x1, y1, x2, y2 = map(int, xyxy)
         box_w  = x2 - x1
@@ -317,25 +272,39 @@ def run_weapon_inference(weapon_model, frame: np.ndarray) -> tuple:
         area   = box_w * box_h
         aspect = box_w / max(box_h, 1)
 
-        if area < frame_area * 0.02:
-            log.debug(f"[WEAPON] {name} skipped — too small ({area}px²)")
+        # ── False-positive filters ─────────────────────────────────────────
+        if area < frame_area * 0.015:
+            log.debug(f"[THREAT] {label} skipped — too small ({area}px²)")
             continue
-        if not (1.2 < aspect < 7.0):
-            log.debug(f"[WEAPON] {name} skipped — aspect {aspect:.2f}")
+
+        if label == "gun" and not (0.5 < aspect < 4.0):
+            log.debug(f"[THREAT] gun skipped — aspect {aspect:.2f}")
             continue
+
+        if label == "knife" and not (1.2 < aspect < 8.0):
+            log.debug(f"[THREAT] knife skipped — aspect {aspect:.2f}")
+            continue
+
         if box_w > fw * 0.85 or box_h > fh * 0.85:
-            log.debug(f"[WEAPON] {name} skipped — bbox too large")
+            log.debug(f"[THREAT] {label} skipped — bbox too large")
             continue
 
         detections.append({
-            "label":      name,
+            "label":      label,
             "confidence": round(conf, 2),
             "bbox":       [x1, y1, x2, y2],
         })
-        if trigger_reason is None:
-            trigger_reason = f"Weapon detected: {name} ({int(conf * 100)}%)"
-            trigger_crop   = pad_crop(frame, xyxy)
-            log.info(f"[WEAPON] ✅ {name} @ {int(conf*100)}% | area={area} aspect={aspect:.2f}")
+        log.info(
+            f"[THREAT] ✅ {label} @ {int(conf*100)}% | "
+            f"area={area} aspect={aspect:.2f}"
+        )
+
+    trigger_reason = None
+    trigger_crop   = None
+    if detections:
+        best           = max(detections, key=lambda d: d["confidence"])
+        trigger_reason = f"Weapon detected: {best['label']} ({int(best['confidence']*100)}%)"
+        trigger_crop   = pad_crop(frame, best["bbox"])
 
     return detections, trigger_reason, trigger_crop
 
@@ -344,9 +313,10 @@ def draw_weapon_boxes(frame: np.ndarray, detections: list) -> np.ndarray:
     for det in detections:
         x1, y1, x2, y2 = det["bbox"]
         label           = f"{det['label']} {int(det['confidence'] * 100)}%"
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        color           = WEAPON_COLORS.get(det["label"], (0, 0, 255))
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-        cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 6, y1), (0, 0, 255), -1)
+        cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 6, y1), color, -1)
         cv2.putText(frame, label, (x1 + 3, y1 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     return frame
@@ -405,7 +375,7 @@ class ProximityTracker:
     def update(self, people_boxes: dict):
         ids          = list(people_boxes.keys())
         now          = time.time()
-        active_pairs: set = set()
+        active_pairs = set()
         result       = None
 
         for i in range(len(ids)):
