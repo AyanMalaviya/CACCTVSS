@@ -1,9 +1,4 @@
-import threading
-import time
-import cv2
-import logging
-import numpy as np
-import torch
+import threading, time, cv2, logging, numpy as np, torch
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,83 +7,51 @@ from datetime import datetime
 
 from detector import (
     load_yolo, load_threat_model, load_vlm,
-    run_vlm, run_weapon_inference, draw_weapon_boxes,
-    state, state_lock,
-    threat_classes,
+    smolvlm_infer, run_vlm_threat, run_weapons, draw_weapons,
+    state, state_lock, threat_classes, yolo_edge_classes,
     ProximityTracker, push_alert, pad_crop,
-    RED_HOLD_SEC, RED_CONFIDENCE,
-    _smolvlm_infer,
-    PERSON_PROMPT, SCENE_PROMPT, COUNT_CHANGE_PROMPT,
+    RED_HOLD_SEC, RED_CONFIDENCE, vlm_abort,
+    DEFAULT_PROXIMITY_PROMPT, DEFAULT_COUNT_CHANGE_PROMPT,
+    DEFAULT_WEAPON_PROMPT, DEFAULT_SCENE_PROMPT,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR = Path("uploads"); UPLOAD_DIR.mkdir(exist_ok=True)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-STREAM_WIDTH        = 640
-STREAM_HEIGHT       = 480
-STREAM_FPS          = 30
-NEW_PERSON_COOLDOWN = 30.0
-VLM_COOLDOWN        = 8.0
-COUNT_CHANGE_DELAY  = 2.0
-VLM_THREAD_TIMEOUT  = 20.0
-WEAPON_MIN_FRAMES   = 3
+STREAM_W           = 640
+STREAM_H           = 480
+STREAM_FPS         = 30
+NEW_PERSON_COOL    = 30.0
+VLM_THREAD_TIMEOUT = 20.0
+WEAPON_MIN_FRAMES  = 3
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(title="CCTV Surveillance API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── State — both YOLO and VLM OFF by default ──────────────────────────────────
-state.update({
-    "scene_description": "",
-    "detection_summary": "",
-    "person_log":        [],
-    "person_count":      0,
-    "weapon_detections": [],
-    "source_fps":        0.0,
-    "yolo_enabled":      False,   # ← off by default
-    "vlm_enabled":       False,   # ← off by default
-    "vlm_interval":      15.0,
-    "mode_switching":    False,
-    "custom_prompt":     "",
-})
-
 # ── Load models ───────────────────────────────────────────────────────────────
-log.info("=" * 50)
-log.info("Loading models...")
 log.info("=" * 50)
 yolo_model               = load_yolo()
 threat_model             = load_threat_model()
 vlm_model, vlm_processor = load_vlm()
 
-# ── GPU setup ─────────────────────────────────────────────────────────────────
 if torch.cuda.is_available():
     torch.cuda.set_per_process_memory_fraction(0.85)
-    yolo_model.to("cuda")
-    yolo_model.model.half()
-    if threat_model is not None:
-        threat_model.to("cuda")
-        threat_model.model.half()
-    log.info(
-        f"[GPU] {torch.cuda.get_device_name(0)} | "
-        f"{torch.cuda.get_device_properties(0).total_memory/1024**3:.1f}GB"
-    )
+    yolo_model.to("cuda"); yolo_model.model.half()
+    if threat_model:
+        threat_model.to("cuda"); threat_model.model.half()
+    log.info(f"[GPU] {torch.cuda.get_device_name(0)}")
 else:
-    log.warning("[GPU] CUDA not available — running on CPU")
-
-log.info("=" * 50)
-log.info("Ready. All routes registered.")
+    log.warning("[GPU] No CUDA")
 log.info("=" * 50)
 
-# ── Engine state ──────────────────────────────────────────────────────────────
+# ── Engine ────────────────────────────────────────────────────────────────────
 engine = {
     "running":    False,
     "source":     None,
@@ -97,150 +60,161 @@ engine = {
     "frame_lock": threading.Lock(),
 }
 
+# ── VLM Priority Task Manager ─────────────────────────────────────────────────
+# "trigger" tasks (weapon/proximity/count_change) preempt "passive" tasks.
+# Triggers never interrupt other triggers — first one wins.
+_vlm_task = {
+    "thread": None,
+    "type":   "passive",   # "passive" | "trigger"
+    "lock":   threading.Lock(),
+}
 
-# ── VRAM helpers ──────────────────────────────────────────────────────────────
-def get_vram_usage_pct() -> float:
+def launch_vlm(task_type: str, fn, args) -> bool:
+    """
+    Launch VLM task with priority.
+    - trigger preempts passive (aborts it via vlm_abort event)
+    - passive skips if anything is running
+    - trigger skips if another trigger is running
+    Returns True if launched.
+    """
+    with _vlm_task["lock"]:
+        t      = _vlm_task["thread"]
+        active = t is not None and t.is_alive()
+
+        if active:
+            if task_type == "trigger" and _vlm_task["type"] == "passive":
+                log.info("[VLM] Aborting passive task — trigger incoming")
+                vlm_abort.set()
+                t.join(timeout=2.0)
+                vlm_abort.clear()
+                # fall through to start trigger
+            else:
+                return False  # skip passive-on-anything or trigger-on-trigger
+
+        def _run():
+            try:
+                fn(*args)
+            except Exception as e:
+                log.warning(f"[VLM task] {e}")
+
+        new_t = threading.Thread(target=_run, daemon=True)
+        new_t._start_time    = time.time()
+        _vlm_task["thread"]  = new_t
+        _vlm_task["type"]    = task_type
+        vlm_abort.clear()
+        new_t.start()
+        return True
+
+
+def vlm_running() -> bool:
+    t = _vlm_task["thread"]
+    return t is not None and t.is_alive()
+
+
+# ── VRAM ──────────────────────────────────────────────────────────────────────
+def get_vram_pct() -> float:
     try:
-        reserved = torch.cuda.memory_reserved()
-        total    = torch.cuda.get_device_properties(0).total_memory
-        return (reserved / total) * 100
+        return (torch.cuda.memory_reserved() /
+                torch.cuda.get_device_properties(0).total_memory * 100)
     except Exception:
         return 0.0
 
-
-def offload_vlm_to_cpu():
+def offload_vlm():
     global vlm_model
-    if vlm_model is None:
-        return
+    if vlm_model is None: return
     try:
         vlm_model = vlm_model.to("cpu")
         torch.cuda.empty_cache()
         log.info("[VLM] Offloaded to CPU")
     except Exception as e:
-        log.warning(f"[VLM] Offload failed: {e}")
+        log.warning(f"[VLM] Offload: {e}")
 
-
-def reload_vlm_to_gpu():
+def reload_vlm():
     global vlm_model
-    if vlm_model is None:
-        return
+    if vlm_model is None: return
     try:
         vlm_model = vlm_model.to("cuda")
         torch.cuda.synchronize()
         log.info("[VLM] Reloaded to GPU")
     except torch.cuda.OutOfMemoryError:
-        log.error("[VLM] OOM reloading — staying on CPU")
         torch.cuda.empty_cache()
+        log.error("[VLM] OOM reload — staying CPU")
     except Exception as e:
-        log.warning(f"[VLM] Reload failed: {e}")
+        log.warning(f"[VLM] Reload: {e}")
 
 
-def safe_vlm_call(fn, args):
-    if get_vram_usage_pct() > 80.0:
-        log.warning("[VLM] VRAM > 80% — skipping")
-        return
-    try:
-        torch.cuda.empty_cache()
-        fn(*args)
-    except torch.cuda.OutOfMemoryError:
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-    except Exception as e:
-        log.warning(f"[VLM] Error: {e}")
-
-
-def _start_vlm_thread(target, args):
-    def wrapped():
-        safe_vlm_call(target, args)
-    t = threading.Thread(target=wrapped, daemon=True)
-    t._start_time = time.time()
-    t.start()
-    return t
-
-
-def call_vlm_text(crop: np.ndarray, prompt: str) -> str:
-    return _smolvlm_infer(crop, prompt, vlm_model, vlm_processor, max_tokens=80)
-
-
-# ── Detection engine ──────────────────────────────────────────────────────────
+# ── Engine ────────────────────────────────────────────────────────────────────
 def run_engine(source):
     prox               = ProximityTracker()
-    vlm_thread         = None
     described_ids      = {}
-    prev_person_count  = 0
-    count_changed_at   = None
+    prev_count         = -1
     frame_count        = 0
     weapon_consecutive = 0
 
-    try:
-        src = int(source)
-    except (ValueError, TypeError):
-        src = source
+    try:    src = int(source)
+    except: src = source
 
     cap = cv2.VideoCapture(src)
     if isinstance(src, int):
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  STREAM_WIDTH)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, STREAM_HEIGHT)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  STREAM_W)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, STREAM_H)
         cap.set(cv2.CAP_PROP_FPS,          STREAM_FPS)
 
     if not cap.isOpened():
-        log.error(f"Cannot open source: {source}")
+        log.error(f"Cannot open: {source}")
         engine["running"] = False
         return
 
-    actual_fps = cap.get(cv2.CAP_PROP_FPS)
-    if actual_fps <= 0 or actual_fps > 120:
-        actual_fps = 30.0
-    frame_delay = 1.0 / actual_fps
-
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0 or fps > 120: fps = 30.0
+    delay = 1.0 / fps
     with state_lock:
-        state["source_fps"] = round(actual_fps, 2)
+        state["source_fps"] = round(fps, 2)
+    log.info(f"Stream: {source} @ {fps:.0f}fps")
 
-    log.info(
-        f"Stream opened → {source} | "
-        f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
-        f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ {actual_fps:.1f}fps"
-    )
-
-    # ── VLM targets ───────────────────────────────────────────────────────────
-    def threat_vlm(crop, reason_prefix):
-        result     = run_vlm(crop, vlm_model, vlm_processor)
-        is_threat  = result.get("threat", False)
-        confidence = result.get("confidence", "low")
-        if is_threat and confidence in RED_CONFIDENCE:
-            push_alert("RED",    f"{reason_prefix} — confirmed: {result.get('type')}", result)
+    # ── VLM callbacks ─────────────────────────────────────────────────────────
+    def do_weapon_vlm(crop, prompt):
+        r = run_vlm_threat(crop, vlm_model, vlm_processor, prompt)
+        if r.get("threat") and r.get("confidence") in RED_CONFIDENCE:
+            push_alert("RED", f"Weapon confirmed: {r.get('type')}", r)
         else:
-            push_alert("YELLOW", f"{reason_prefix} — unconfirmed by VLM", result)
+            push_alert("YELLOW", f"Weapon detected — unconfirmed by VLM", r)
 
-    def person_vlm(track_id, crop, prompt_override=None):
-        desc = call_vlm_text(crop, prompt_override or PERSON_PROMPT)
-        if not desc:
-            return
+    def do_proximity_vlm(crop, prompt):
+        desc = smolvlm_infer(crop, prompt or DEFAULT_PROXIMITY_PROMPT,
+                             vlm_model, vlm_processor, max_tokens=80)
+        if not desc: return
+        threat = any(w in desc.lower() for w in
+                     ["threatening", "assault", "attack", "fight", "danger"])
+        if threat:
+            push_alert("RED",    f"Proximity threat: {desc[:80]}")
+        else:
+            push_alert("YELLOW", f"Sustained contact: {desc[:80]}")
         with state_lock:
-            state["person_log"].append({
-                "time":        datetime.now().strftime("%H:%M:%S"),
-                "track_id":    track_id,
-                "description": desc,
-            })
-            state["person_log"] = state["person_log"][-50:]
-        log.info(f"[PERSON] ID#{track_id}: {desc}")
+            state["scene_description"] = desc
 
-    def scene_vlm(crop, prompt=None):
-        desc = call_vlm_text(crop, prompt or SCENE_PROMPT)
+    def do_count_change_vlm(crop, prompt):
+        desc = smolvlm_infer(crop, prompt or DEFAULT_COUNT_CHANGE_PROMPT,
+                             vlm_model, vlm_processor, max_tokens=60)
         if desc:
             with state_lock:
                 state["scene_description"] = desc
-            log.info(f"[SCENE] {desc}")
+            log.info(f"[COUNT VLM] {desc}")
+
+    def do_scene_vlm(crop, prompt):
+        desc = smolvlm_infer(crop, prompt or DEFAULT_SCENE_PROMPT,
+                             vlm_model, vlm_processor, max_tokens=60)
+        if desc:
+            with state_lock:
+                state["scene_description"] = desc
 
     # ── Main loop ─────────────────────────────────────────────────────────────
     while engine["running"]:
-        loop_start = time.time()
-
+        t0 = time.time()
         ret, frame = cap.read()
         if not ret:
             if isinstance(src, str):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                continue
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0); continue
             break
 
         try:
@@ -248,257 +222,209 @@ def run_engine(source):
             now = time.time()
 
             with state_lock:
-                yolo_on       = state["yolo_enabled"]
-                vlm_on        = state["vlm_enabled"]
-                vlm_ivl       = state["vlm_interval"]
-                last_vlm      = state["last_vlm_time"]
-                is_switching  = state["mode_switching"]
-                custom_prompt = state["custom_prompt"].strip()
+                yolo_on  = state["yolo_enabled"]
+                vlm_on   = state["vlm_enabled"]
+                vlm_ivl  = state["vlm_interval"]
+                last_vlm = state["last_vlm_time"]
+                switching= state["mode_switching"]
+                prompts  = dict(state["trigger_prompts"])
 
-            # ── CASE 1: Both off — raw frame, 30fps, no inference ─────────────
+            # ── RAW mode ──────────────────────────────────────────────────────
             if not yolo_on and not vlm_on:
-                h_f, w_f = frame.shape[:2]
-                display  = frame.copy()
-                cv2.rectangle(display, (0, 0), (w_f, 40), (30, 30, 30), -1)
-                cv2.putText(display, "RAW FEED — YOLO & VLM disabled",
-                            (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (140, 140, 140), 1)
-                cv2.putText(display, f"{actual_fps:.0f}fps",
-                            (w_f-55, h_f-10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80,80,80), 1)
-                _, buf = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 with engine["frame_lock"]:
                     engine["frame"] = buf.tobytes()
-                time.sleep(max(0, frame_delay - (time.time() - loop_start)))
-                continue
-
-            if is_switching:
-                time.sleep(max(0, frame_delay - (time.time() - loop_start)))
-                continue
+                time.sleep(max(0, delay-(time.time()-t0))); continue
 
             # ── VLM thread watchdog ────────────────────────────────────────────
-            if (vlm_thread is not None
-                    and vlm_thread.is_alive()
-                    and hasattr(vlm_thread, "_start_time")
-                    and now - vlm_thread._start_time > VLM_THREAD_TIMEOUT):
-                log.warning("[VLM] Thread hung >20s — abandoning")
-                vlm_thread = None
-                torch.cuda.empty_cache()
+            t_obj = _vlm_task["thread"]
+            if (t_obj and t_obj.is_alive()
+                    and hasattr(t_obj, "_start_time")
+                    and now - t_obj._start_time > VLM_THREAD_TIMEOUT):
+                log.warning("[VLM] Watchdog: thread hung >20s — aborting")
+                vlm_abort.set()
+                t_obj.join(timeout=1.0)
+                vlm_abort.clear()
 
-            # ── CASE 2: YOLO only ─────────────────────────────────────────────
-            annotated         = frame
-            people_boxes      = {}
-            class_counts      = {}
-            weapon_detections = []
-            yolo_trigger      = None
+            # ── YOLO tracking ─────────────────────────────────────────────────
+            annotated    = frame
+            people_boxes = {}
+            class_counts = {}
+            weapon_dets  = []
+            edge_dets    = []   # axe/scissor/crowbar from yolo26n
+            yolo_trigger = None
 
             if yolo_on:
-                track_results = yolo_model.track(
+                tr = yolo_model.track(
                     frame, persist=True, tracker="bytetrack.yaml",
                     conf=0.4, imgsz=640, verbose=False,
                 )
-                annotated = track_results[0].plot()
+                annotated = tr[0].plot()
 
-                # Weapon detection
-                w_dets, w_trigger, _ = run_weapon_inference(threat_model, frame)
-                if w_dets:
-                    weapon_consecutive += 1
-                else:
-                    weapon_consecutive = 0
-                confirmed_weapon = weapon_consecutive >= WEAPON_MIN_FRAMES
-
-                if confirmed_weapon and w_trigger:
-                    weapon_detections = w_dets
-                    yolo_trigger      = w_trigger
-                    annotated         = draw_weapon_boxes(annotated, weapon_detections)
-
-                with state_lock:
-                    state["weapon_detections"] = weapon_detections
-
-                # Person boxes from YOLO
-                for box in track_results[0].boxes:
-                    if box.id is None:
-                        continue
-                    cls_id   = int(box.cls)
-                    track_id = int(box.id)
-                    xyxy     = box.xyxy[0].cpu().numpy()
-                    name     = yolo_model.names[cls_id]
+                for box in tr[0].boxes:
+                    if box.id is None: continue
+                    cid  = int(box.cls)
+                    tid  = int(box.id)
+                    xyxy = box.xyxy[0].cpu().numpy()
+                    name = yolo_model.names[cid]
                     class_counts[name] = class_counts.get(name, 0) + 1
 
-                    if cls_id == 0:
-                        people_boxes[track_id] = xyxy
+                    # Person
+                    if cid == 0:
+                        people_boxes[tid] = xyxy
 
-                        # Person VLM description (only if VLM also on)
-                        if vlm_on and vlm_model is not None:
-                            cx       = int((xyxy[0] + xyxy[2]) / 2 / 80)
-                            cy_grid  = int((xyxy[1] + xyxy[3]) / 2 / 80)
-                            pos_hash = cx * 1000 + cy_grid
-                            last_e   = described_ids.get(track_id, {"time": 0, "pos_hash": -1})
-                            if (last_e["time"] == 0
-                                    or (now - last_e["time"] > NEW_PERSON_COOLDOWN
-                                        and last_e["pos_hash"] != pos_hash)):
-                                described_ids[track_id] = {"time": now, "pos_hash": pos_hash}
-                                crop = pad_crop(frame, xyxy, pad=40)
-                                if crop.size > 0 and (vlm_thread is None or not vlm_thread.is_alive()):
-                                    vlm_thread = _start_vlm_thread(
-                                        person_vlm,
-                                        (track_id, crop.copy(),
-                                         custom_prompt if custom_prompt else None),
-                                    )
+                    # Edge weapon from yolo26n class names
+                    if cid in yolo_edge_classes:
+                        conf = float(box.conf[0])
+                        if conf >= 0.60:
+                            x1,y1,x2,y2 = map(int, xyxy)
+                            edge_dets.append({
+                                "label":      yolo_edge_classes[cid],
+                                "confidence": round(conf, 2),
+                                "bbox":       [x1,y1,x2,y2],
+                            })
 
                 with state_lock:
                     state["person_count"] = len(people_boxes)
 
-                # Proximity check
-                if yolo_trigger is None:
-                    prox_result = prox.update(people_boxes)
-                    if prox_result:
-                        pair_ids, mb = prox_result
-                        yolo_trigger = f"Sustained contact — IDs {pair_ids}"
+                # ── Weapon detection ──────────────────────────────────────────
+                w_dets, w_trigger, w_crop = run_weapons(
+                    threat_model, frame, edge_dets
+                )
+                if w_dets:
+                    weapon_consecutive += 1
+                else:
+                    weapon_consecutive  = 0
 
-            # ── CASE 3: VLM logic (only if vlm_on) ───────────────────────────
+                if weapon_consecutive >= WEAPON_MIN_FRAMES and w_trigger:
+                    weapon_dets  = w_dets
+                    yolo_trigger = ("weapon", w_trigger, w_crop)
+                    annotated    = draw_weapons(annotated, weapon_dets)
+
+                with state_lock:
+                    state["weapon_detections"] = weapon_dets
+
+                # ── Proximity trigger ─────────────────────────────────────────
+                if yolo_trigger is None:
+                    pr = prox.update(people_boxes)
+                    if pr:
+                        pair_ids, mb = pr
+                        crop = pad_crop(frame, mb)
+                        yolo_trigger = (
+                            "proximity",
+                            f"Sustained contact — IDs {pair_ids}",
+                            crop,
+                        )
+
+                # ── Count change trigger ──────────────────────────────────────
+                cur_count = len(people_boxes)
+                if cur_count != prev_count and prev_count != -1:
+                    # Always fire VLM on count change if enabled
+                    log.info(f"[COUNT] {prev_count} → {cur_count}")
+                    if vlm_on and vlm_model and get_vram_pct() < 75:
+                        with state_lock:
+                            state["last_vlm_time"] = now
+                        launched = launch_vlm(
+                            "trigger", do_count_change_vlm,
+                            (frame.copy(), prompts.get("count_change", ""))
+                        )
+                        if launched:
+                            push_alert("YELLOW",
+                                       f"Person count: {prev_count}→{cur_count}")
+                prev_count = cur_count
+
+            # ── VLM trigger dispatch ──────────────────────────────────────────
             with state_lock:
                 cur_alert = state["alert"]
                 last_red  = state["last_red_time"]
                 last_vlm  = state["last_vlm_time"]
 
-            if vlm_on:
-                # Count change scene description
-                current_count = len(people_boxes)
-                if current_count != prev_person_count:
-                    count_changed_at  = now
-                    prev_person_count = current_count
-
-                if (count_changed_at is not None
-                        and now - count_changed_at >= COUNT_CHANGE_DELAY
-                        and now - last_vlm >= VLM_COOLDOWN
-                        and vlm_model is not None
-                        and (vlm_thread is None or not vlm_thread.is_alive())):
+            if yolo_trigger:
+                kind, reason, crop = yolo_trigger
+                if vlm_on and vlm_model and get_vram_pct() < 75:
                     with state_lock:
                         state["last_vlm_time"] = now
-                    count_changed_at = None
-                    vlm_thread = _start_vlm_thread(
-                        scene_vlm,
-                        (frame.copy(), custom_prompt if custom_prompt else COUNT_CHANGE_PROMPT),
-                    )
+                    if kind == "weapon":
+                        launch_vlm("trigger", do_weapon_vlm,
+                                   (crop.copy(), prompts.get("weapon", "")))
+                    elif kind == "proximity":
+                        launch_vlm("trigger", do_proximity_vlm,
+                                   (crop.copy(), prompts.get("proximity", "")))
+                if cur_alert == "CLEAR":
+                    push_alert("YELLOW", reason)
 
-                # Threat VLM on weapon/proximity trigger
-                if yolo_trigger and yolo_on:
-                    reason = yolo_trigger if isinstance(yolo_trigger, str) else str(yolo_trigger)
-                    crop   = pad_crop(frame, weapon_detections[0]["bbox"]) \
-                             if weapon_detections else frame
-                    if (get_vram_usage_pct() < 75.0
-                            and now - last_vlm >= VLM_COOLDOWN
-                            and vlm_model is not None
-                            and (vlm_thread is None or not vlm_thread.is_alive())):
-                        with state_lock:
-                            state["last_vlm_time"] = now
-                        vlm_thread = _start_vlm_thread(threat_vlm, (crop.copy(), reason))
-                    if cur_alert == "CLEAR":
-                        push_alert("YELLOW", reason)
+            # ── Passive scene VLM (interval-based) ────────────────────────────
+            if (vlm_on and vlm_model
+                    and now - last_vlm >= vlm_ivl
+                    and not yolo_trigger
+                    and get_vram_pct() < 75):
+                with state_lock:
+                    state["last_vlm_time"] = now
+                launch_vlm("passive", do_scene_vlm, (frame.copy(), ""))
 
-                # VLM only — passive scene with no YOLO
-                elif not yolo_on:
-                    if (now - last_vlm >= vlm_ivl
-                            and vlm_model is not None
-                            and (vlm_thread is None or not vlm_thread.is_alive())):
-                        with state_lock:
-                            state["last_vlm_time"] = now
-                        vlm_thread = _start_vlm_thread(
-                            scene_vlm,
-                            (frame.copy(), custom_prompt if custom_prompt else None),
-                        )
+            # ── Person description (VLM + YOLO both on) ───────────────────────
+            if yolo_on and vlm_on and vlm_model:
+                for tid, xyxy in people_boxes.items():
+                    cx = int((xyxy[0]+xyxy[2])/2/80)
+                    cy = int((xyxy[1]+xyxy[3])/2/80)
+                    ph = cx*1000+cy
+                    le = described_ids.get(tid, {"time":0,"ph":-1})
+                    if (le["time"]==0
+                            or (now-le["time"]>NEW_PERSON_COOL and le["ph"]!=ph)):
+                        described_ids[tid] = {"time":now,"ph":ph}
+                        crop = pad_crop(frame, xyxy, 40)
+                        if crop.size > 0:
+                            def _person_desc(t_id=tid, c=crop.copy()):
+                                desc = smolvlm_infer(
+                                    c,
+                                    "Describe this person's actions in 1 sentence. "
+                                    "What is most noticeable about them?",
+                                    vlm_model, vlm_processor, max_tokens=60
+                                )
+                                if desc:
+                                    with state_lock:
+                                        state["person_log"].append({
+                                            "time":        datetime.now().strftime("%H:%M:%S"),
+                                            "track_id":    t_id,
+                                            "description": desc,
+                                        })
+                                        state["person_log"] = state["person_log"][-50:]
+                            launch_vlm("passive", _person_desc, ())
 
-                # Passive scene when YOLO on but no trigger
-                elif (not yolo_trigger
-                        and now - last_vlm >= vlm_ivl
-                        and count_changed_at is None
-                        and vlm_model is not None
-                        and (vlm_thread is None or not vlm_thread.is_alive())):
-                    with state_lock:
-                        state["last_vlm_time"] = now
-                    vlm_thread = _start_vlm_thread(
-                        scene_vlm,
-                        (frame.copy(), custom_prompt if custom_prompt else None),
-                    )
-            else:
-                # VLM off — YOLO-only alert from weapon/proximity
-                if yolo_on and yolo_trigger:
-                    if cur_alert == "CLEAR":
-                        reason = yolo_trigger if isinstance(yolo_trigger, str) else str(yolo_trigger)
-                        push_alert("YELLOW", reason)
-
-            # Clear alert when nothing happening
+            # ── Clear stale alert ─────────────────────────────────────────────
             with state_lock:
                 cur_alert = state["alert"]
                 last_red  = state["last_red_time"]
             if (cur_alert != "CLEAR"
                     and not yolo_trigger
                     and now - last_red >= RED_HOLD_SEC
-                    and (vlm_thread is None or not vlm_thread.is_alive())):
+                    and not vlm_running()):
                 push_alert("CLEAR", "")
 
             # ── Detection summary ──────────────────────────────────────────────
-            weapon_names = [d["label"] for d in weapon_detections]
-            person_str   = f"{len(people_boxes)} person(s)" if people_boxes else ""
-            weapon_str   = f"⚠️ {', '.join(weapon_names)}"  if weapon_names else ""
-            other_str    = ", ".join(
-                f"{v}× {k}" for k, v in class_counts.items()
-                if k != "person" and k not in weapon_names
-            )
-            summary = " | ".join(p for p in [person_str, weapon_str, other_str] if p) \
-                      or ("Streaming..." if not yolo_on else "Nothing detected")
+            w_names = [d["label"] for d in weapon_dets]
+            p_str   = f"{len(people_boxes)} person(s)" if people_boxes else ""
+            w_str   = f"⚠️ {', '.join(w_names)}"      if w_names    else ""
+            o_str   = ", ".join(f"{v}× {k}" for k,v in class_counts.items()
+                                if k != "person" and k not in w_names)
             with state_lock:
-                state["detection_summary"] = summary
+                state["detection_summary"] = (
+                    " | ".join(p for p in [p_str,w_str,o_str] if p)
+                    or ("Streaming…" if not yolo_on else "Nothing detected")
+                )
 
             # ── Overlay ────────────────────────────────────────────────────────
-            h_f, w_f = annotated.shape[:2]
-
-            with state_lock:
-                alert_now  = state["alert"]
-                reason_now = state["reason"]
-                desc_now   = state["scene_description"]
-                count_now  = state["person_count"]
-
-            # Status bar
-            bar_color = {
-                "CLEAR":  (30, 160, 30),
-                "YELLOW": (0,  180, 255),
-                "RED":    (0,  0,   210),
-            }.get(alert_now, (40, 40, 40))
-            cv2.rectangle(annotated, (0, 0), (w_f, 46), bar_color, -1)
-            cv2.putText(annotated, f"[{alert_now}]  {reason_now[:72]}",
-                        (8, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2)
-
-            # Right badge
-            badge = []
-            if yolo_on: badge.append(f"YOLO  👥{count_now}")
-            if vlm_on:  badge.append("VLM")
-            badge_str = "  |  ".join(badge) if badge else "RAW"
-            cv2.rectangle(annotated, (w_f-200, 0), (w_f, 46), (25, 25, 25), -1)
-            cv2.putText(annotated, badge_str,
-                        (w_f-190, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
-
-            # FPS
-            cv2.putText(annotated, f"{actual_fps:.0f}fps",
-                        (w_f-55, h_f-10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80,80,80), 1)
-
-            # Scene description
-            if desc_now and vlm_on:
-                cv2.putText(annotated, f"💬 {desc_now[:95]}",
-                            (8, h_f-10), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 255, 180), 1)
-
-            _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 85])
             with engine["frame_lock"]:
                 engine["frame"] = buf.tobytes()
 
         except torch.cuda.OutOfMemoryError:
-            log.error(f"[ENGINE] OOM on frame #{frame_count} — recovering")
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            time.sleep(0.5)
+            log.error(f"OOM frame #{frame_count}")
+            torch.cuda.empty_cache(); torch.cuda.synchronize(); time.sleep(0.5)
         except Exception as e:
-            log.error(f"[ENGINE] Frame #{frame_count} error: {e}")
+            log.error(f"Engine #{frame_count}: {e}")
 
-        time.sleep(max(0, frame_delay - (time.time() - loop_start)))
+        time.sleep(max(0, delay-(time.time()-t0)))
 
     cap.release()
     engine["running"] = False
@@ -506,87 +432,71 @@ def run_engine(source):
         state["weapon_detections"] = []
         state["source_fps"]        = 0.0
     push_alert("CLEAR", "")
-    log.info("[ENGINE] Stopped.")
+    log.info("[ENGINE] Stopped")
 
 
-# ── MJPEG stream ──────────────────────────────────────────────────────────────
-def mjpeg_generator():
+# ── MJPEG ─────────────────────────────────────────────────────────────────────
+def mjpeg_gen():
     while True:
         with engine["frame_lock"]:
-            frame = engine["frame"]
-        if frame:
-            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+            f = engine["frame"]
+        if f:
+            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + f + b"\r\n"
         time.sleep(0.033)
 
 
-# ── Engine helpers ────────────────────────────────────────────────────────────
-def _stop_engine():
+def _stop():
     engine["running"] = False
+    # Abort any running VLM
+    vlm_abort.set()
     if engine["thread"] and engine["thread"].is_alive():
         engine["thread"].join(timeout=4)
+    vlm_abort.clear()
     with state_lock:
         state.update({
-            "alert":             "CLEAR",
-            "reason":            "",
-            "person_count":      0,
-            "weapon_detections": [],
-            "source_fps":        0.0,
-            "detection_summary": "",
+            "alert":"CLEAR","reason":"","person_count":0,
+            "weapon_detections":[],"source_fps":0.0,
+            "detection_summary":"","scene_description":"",
         })
     with engine["frame_lock"]:
         engine["frame"] = None
 
-
-def _start_engine(source):
-    _stop_engine()
+def _start(source):
+    _stop()
     engine["source"]  = source
     engine["running"] = True
-    engine["thread"]  = threading.Thread(
-        target=run_engine, args=(source,), daemon=True
-    )
+    engine["thread"]  = threading.Thread(target=run_engine,
+                                         args=(source,), daemon=True)
     engine["thread"].start()
 
 
-# ── API Routes ─────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "CCTV Surveillance API running"}
-
+    return {"status": "ok"}
 
 @app.get("/video_feed")
 def video_feed():
-    return StreamingResponse(
-        mjpeg_generator(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-    )
-
+    return StreamingResponse(mjpeg_gen(),
+                             media_type="multipart/x-mixed-replace; boundary=frame")
 
 @app.post("/start/camera")
 def start_camera(index: int = 0):
-    _start_engine(index)
-    return {"status": "started", "source": f"camera:{index}"}
-
+    _start(index); return {"status":"started","source":f"camera:{index}"}
 
 @app.post("/start/video")
 async def start_video(file: UploadFile = File(...)):
-    save_path = UPLOAD_DIR / file.filename
-    with open(save_path, "wb") as f:
-        f.write(await file.read())
-    _start_engine(str(save_path))
-    return {"status": "started", "source": file.filename}
-
+    p = UPLOAD_DIR / file.filename
+    p.write_bytes(await file.read())
+    _start(str(p)); return {"status":"started","source":file.filename}
 
 @app.post("/start/path")
 def start_path(path: str):
-    _start_engine(path)
-    return {"status": "started", "source": path}
-
+    _start(path); return {"status":"started","source":path}
 
 @app.post("/stop")
 def stop():
-    _stop_engine()
-    return {"status": "stopped"}
-
+    _stop(); return {"status":"stopped"}
 
 @app.get("/status")
 def get_status():
@@ -607,113 +517,104 @@ def get_status():
             "vlm_enabled":       state["vlm_enabled"],
             "vlm_interval":      state["vlm_interval"],
             "mode_switching":    state["mode_switching"],
-            "custom_prompt":     state["custom_prompt"],
-            "vram_pct":          round(get_vram_usage_pct(), 1),
+            "trigger_prompts":   dict(state["trigger_prompts"]),
+            "vram_pct":          round(get_vram_pct(), 1),
         }
-
 
 @app.get("/alerts")
 def get_alerts():
-    with state_lock:
-        return state["alert_log"]
-
+    with state_lock: return state["alert_log"]
 
 @app.get("/persons")
 def get_persons():
-    with state_lock:
-        return state["person_log"]
-
+    with state_lock: return state["person_log"]
 
 @app.get("/vram")
 def get_vram():
     try:
-        props = torch.cuda.get_device_properties(0)
-        total = props.total_memory / 1024**3
+        p = torch.cuda.get_device_properties(0)
+        t = p.total_memory / 1024**3
         return {
-            "gpu_name":     props.name,
-            "total_gb":     round(total, 2),
-            "allocated_gb": round(torch.cuda.memory_allocated() / 1024**3, 2),
-            "reserved_gb":  round(torch.cuda.memory_reserved()  / 1024**3, 2),
-            "free_gb":      round(total - torch.cuda.memory_reserved() / 1024**3, 2),
-            "usage_pct":    round(get_vram_usage_pct(), 1),
+            "gpu_name":     p.name,
+            "total_gb":     round(t, 2),
+            "allocated_gb": round(torch.cuda.memory_allocated()/1024**3, 2),
+            "reserved_gb":  round(torch.cuda.memory_reserved()/1024**3,  2),
+            "free_gb":      round(t - torch.cuda.memory_reserved()/1024**3, 2),
+            "usage_pct":    round(get_vram_pct(), 1),
         }
     except Exception as e:
         return {"error": str(e)}
 
-
 @app.get("/weapon_classes")
 def get_weapon_classes():
-    return {"active_classes": list(threat_classes.values())}
-
+    return {"threat_model": list(threat_classes.values()),
+            "yolo_edge":    list(yolo_edge_classes.values())}
 
 # ── YOLO toggle ────────────────────────────────────────────────────────────────
 @app.post("/yolo/enable")
 def yolo_enable():
-    with state_lock:
-        state["yolo_enabled"] = True
-    log.info("[YOLO] Enabled")
+    with state_lock: state["yolo_enabled"] = True
     return {"yolo_enabled": True}
-
 
 @app.post("/yolo/disable")
 def yolo_disable():
     with state_lock:
-        state["yolo_enabled"] = False
+        state["yolo_enabled"]      = False
         state["weapon_detections"] = []
         state["person_count"]      = 0
         state["detection_summary"] = ""
-    log.info("[YOLO] Disabled")
     return {"yolo_enabled": False}
-
 
 # ── VLM toggle ─────────────────────────────────────────────────────────────────
 @app.post("/vlm/enable")
 def vlm_enable():
     with state_lock:
-        switching = state["mode_switching"]
-    if switching:
-        return {"error": "Mode switch in progress"}
-    with state_lock:
+        if state["mode_switching"]:
+            return {"error": "Already switching"}
         state["mode_switching"] = True
-
-    def do_enable():
-        reload_vlm_to_gpu()
+    def do():
+        reload_vlm()
         with state_lock:
-            state["vlm_enabled"]  = True
+            state["vlm_enabled"]    = True
             state["mode_switching"] = False
-        log.info("[VLM] Enabled")
-
-    threading.Thread(target=do_enable, daemon=True).start()
+    threading.Thread(target=do, daemon=True).start()
     return {"vlm_enabled": True, "mode_switching": True}
-
 
 @app.post("/vlm/disable")
 def vlm_disable():
+    vlm_abort.set()
     with state_lock:
-        state["vlm_enabled"]     = False
+        state["vlm_enabled"]       = False
         state["scene_description"] = ""
-    offload_vlm_to_cpu()
-    log.info("[VLM] Disabled")
+    time.sleep(0.2)
+    vlm_abort.clear()
+    offload_vlm()
     return {"vlm_enabled": False}
 
-
+# ── VLM interval (2–30 s) ─────────────────────────────────────────────────────
 @app.post("/vlm/interval")
-def set_vlm_interval(seconds: float):
-    seconds = max(5.0, min(seconds, 120.0))
-    with state_lock:
-        state["vlm_interval"] = seconds
+def set_interval(seconds: float):
+    seconds = max(2.0, min(seconds, 30.0))
+    with state_lock: state["vlm_interval"] = seconds
     return {"vlm_interval": seconds}
 
+# ── Trigger prompts ────────────────────────────────────────────────────────────
+@app.get("/trigger_prompts")
+def get_trigger_prompts():
+    with state_lock: return dict(state["trigger_prompts"])
 
-@app.post("/vlm/prompt")
-def set_custom_prompt(prompt: str = ""):
+@app.post("/trigger_prompts/{trigger_type}")
+def set_trigger_prompt(trigger_type: str, prompt: str = ""):
+    if trigger_type not in ("proximity", "count_change", "weapon"):
+        return {"error": "trigger_type must be proximity | count_change | weapon"}
     with state_lock:
-        state["custom_prompt"] = prompt.strip()
-    return {"custom_prompt": state["custom_prompt"]}
+        state["trigger_prompts"][trigger_type] = prompt.strip()
+    return {"trigger_type": trigger_type, "prompt": prompt.strip()}
 
-
-@app.delete("/vlm/prompt")
-def clear_custom_prompt():
+@app.delete("/trigger_prompts/{trigger_type}")
+def clear_trigger_prompt(trigger_type: str):
+    if trigger_type not in ("proximity", "count_change", "weapon"):
+        return {"error": "Invalid trigger type"}
     with state_lock:
-        state["custom_prompt"] = ""
-    return {"custom_prompt": ""}
+        state["trigger_prompts"][trigger_type] = ""
+    return {"trigger_type": trigger_type, "prompt": ""}
