@@ -286,6 +286,137 @@ function SceneDescCard({ status }) {
   )
 }
 
+const VLM_ENTRY_STYLES = {
+  red: {
+    bg:    "bg-red-950/25",
+    border:"border-red-900/60",
+    badge: "bg-red-900/70 text-red-200 border-red-800/70",
+  },
+  yellow: {
+    bg:    "bg-yellow-950/20",
+    border:"border-yellow-900/60",
+    badge: "bg-yellow-900/70 text-yellow-200 border-yellow-800/70",
+  },
+  blue: {
+    bg:    "bg-blue-950/20",
+    border:"border-blue-900/60",
+    badge: "bg-blue-900/70 text-blue-200 border-blue-800/70",
+  },
+  purple: {
+    bg:    "bg-purple-950/20",
+    border:"border-purple-900/60",
+    badge: "bg-purple-900/70 text-purple-200 border-purple-800/70",
+  },
+}
+
+function buildVlmDescriptionEntries(status, alerts, persons) {
+  const entries = []
+
+  if (status?.alert && status.alert !== "CLEAR" && status?.description) {
+    entries.push({
+      key: `status-${status.alert}`,
+      label: "Current alert",
+      icon: status.alert === "RED" ? "🔴" : "🟡",
+      tone: status.alert === "RED" ? "red" : "yellow",
+      time: status?.reason ? "active" : "",
+      text: status.description,
+    })
+  }
+
+  for (const alert of alerts ?? []) {
+    if (!alert?.vlm) continue
+    entries.push({
+      key: `alert-${alert.time}-${alert.alert}-${alert.vlm}`,
+      label: `${alert.alert} alert`,
+      icon: alert.alert === "RED" ? "🔴" : alert.alert === "YELLOW" ? "🟡" : "🟢",
+      tone: alert.alert === "RED" ? "red" : alert.alert === "YELLOW" ? "yellow" : "purple",
+      time: alert.time ?? "",
+      text: alert.vlm,
+    })
+  }
+
+  for (const person of persons ?? []) {
+    if (!person?.description) continue
+    entries.push({
+      key: `person-${person.track_id}-${person.time}-${person.description}`,
+      label: `Person #${person.track_id}`,
+      icon: "👤",
+      tone: "blue",
+      time: person.time ?? "",
+      text: person.description,
+    })
+  }
+
+  const seen = new Set()
+  return entries.filter(entry => {
+    const text = entry.text.trim().toLowerCase()
+    if (!text || seen.has(text)) return false
+    seen.add(text)
+    return true
+  })
+}
+
+function VlmDescriptionsCard({ status, alerts, persons }) {
+  const vlmOn = status?.vlm_enabled
+  const entries = buildVlmDescriptionEntries(status, alerts, persons)
+
+  return (
+    <div className="p-4 border-b border-gray-800">
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-bold text-gray-500 uppercase tracking-wider">
+            🧠 VLM Descriptions
+          </span>
+          {entries.length > 0 && (
+            <span className="text-[11px] text-gray-600 bg-gray-800 px-2 py-0.5 rounded-full">
+              {entries.length}
+            </span>
+          )}
+        </div>
+        <span className="text-[11px] text-gray-600">
+          {vlmOn ? "Recent outputs" : "VLM off"}
+        </span>
+      </div>
+
+      {entries.length ? (
+        <div className="flex flex-col gap-2">
+          {entries.map(entry => {
+            const style = VLM_ENTRY_STYLES[entry.tone] ?? VLM_ENTRY_STYLES.purple
+            return (
+              <div
+                key={entry.key}
+                className={`rounded-xl p-3 border ${style.border} ${style.bg}`}
+              >
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <span className={`text-[11px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full border ${style.badge}`}>
+                    {entry.icon} {entry.label}
+                  </span>
+                  {entry.time && (
+                    <span className="text-[11px] text-gray-600 font-mono shrink-0">
+                      {entry.time}
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-gray-300 leading-relaxed">
+                  {entry.text}
+                </p>
+              </div>
+            )
+          })}
+        </div>
+      ) : (
+        <div className="rounded-xl border border-gray-700/50 bg-gray-800/30 p-3">
+          <p className="text-xs text-gray-500 leading-relaxed">
+            {vlmOn
+              ? "Waiting for VLM alert or person descriptions."
+              : "Enable VLM and start a stream to surface descriptions here."}
+          </p>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function LiveStatsCard({ status, isRunning }) {
   const stats = [
     {
@@ -509,6 +640,7 @@ function RightPanel({ status, alerts, persons, vram, isRunning }) {
           <>
             <AlertStatusCard status={status} />
             <SceneDescCard   status={status} />
+            <VlmDescriptionsCard status={status} alerts={alerts} persons={persons} />
             <LiveStatsCard   status={status} isRunning={isRunning} />
             <WeaponsCard     detections={status?.weapon_detections} />
             <VramSection     vram={vram} />
