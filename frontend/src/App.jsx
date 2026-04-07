@@ -23,7 +23,7 @@ const PRESETS = {
 const TRIGGER_META = {
   proximity:    { icon: "🤝", label: "Proximity Trigger",  sublabel: "2 persons close for 2.5s",        color: "yellow" },
   count_change: { icon: "👥", label: "Count Change",        sublabel: "Person count increases/decreases", color: "blue"   },
-  weapon:       { icon: "🔪", label: "Weapon Trigger",      sublabel: "Knife / axe / scissor detected",  color: "red"    },
+  weapon:       { icon: "🔪", label: "Weapon Trigger",      sublabel: "Knife / bat / axe / scissor incidents",  color: "red"    },
 }
 
 // ── Primitives ────────────────────────────────────────────────────────────────
@@ -76,7 +76,17 @@ function VramBar({ vram }) {
   )
 }
 
-function TriggerPromptEditor({ triggerType, value, onChange, onSave, onClear, saving, saved }) {
+function TriggerPromptEditor({
+  triggerType,
+  value,
+  onChange,
+  onSave,
+  onClear,
+  saving,
+  saved,
+  onFocus,
+  onBlur,
+}) {
   const [open, setOpen] = useState(false)
   const meta = TRIGGER_META[triggerType]
   const borderColor = {
@@ -110,6 +120,8 @@ function TriggerPromptEditor({ triggerType, value, onChange, onSave, onClear, sa
         <textarea
           value={value}
           onChange={e => onChange(e.target.value)}
+          onFocus={onFocus}
+          onBlur={onBlur}
           placeholder={`Default: "${PRESETS[triggerType][0].slice(0, 48)}…"`}
           rows={3}
           className="w-full bg-gray-900 border border-gray-700 rounded-lg px-2.5 py-2
@@ -309,6 +321,74 @@ const VLM_ENTRY_STYLES = {
   },
 }
 
+const PROMPT_OUTPUT_META = [
+  { key: "proximity",    icon: "🤝", label: "Proximity Prompt",    tone: "yellow" },
+  { key: "count_change", icon: "👥", label: "Count Change Prompt", tone: "blue" },
+  { key: "weapon",       icon: "🔪", label: "Weapon Prompt",       tone: "red" },
+  { key: "scene",        icon: "🧠", label: "Scene Prompt",        tone: "purple" },
+]
+
+function PromptOutputsCard({ outputs, vlmEnabled }) {
+  const readOutput = key => {
+    const value = outputs?.[key]
+    if (value && typeof value === "object") {
+      return {
+        description: String(value.description ?? "").trim(),
+        time: String(value.time ?? ""),
+      }
+    }
+    if (typeof value === "string") {
+      return { description: value.trim(), time: "" }
+    }
+    return { description: "", time: "" }
+  }
+
+  return (
+    <div className="p-4 border-b border-gray-800">
+      <div className="flex items-center justify-between mb-3">
+        <span className="text-xs font-bold text-gray-500 uppercase tracking-wider">
+          🎯 Prompt Outputs
+        </span>
+        <span className="text-[11px] text-gray-600">
+          Latest from 4 prompt flows
+        </span>
+      </div>
+
+      <div className="flex flex-col gap-2">
+        {PROMPT_OUTPUT_META.map(meta => {
+          const style = VLM_ENTRY_STYLES[meta.tone] ?? VLM_ENTRY_STYLES.purple
+          const out = readOutput(meta.key)
+          const hasText = Boolean(out.description)
+
+          return (
+            <div
+              key={meta.key}
+              className={`rounded-xl p-3 border ${style.border} ${style.bg}`}
+            >
+              <div className="flex items-center justify-between gap-2 mb-1.5">
+                <span className={`text-[11px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full border ${style.badge}`}>
+                  {meta.icon} {meta.label}
+                </span>
+                {out.time && (
+                  <span className="text-[11px] text-gray-600 font-mono shrink-0">
+                    {out.time}
+                  </span>
+                )}
+              </div>
+
+              <p className={`text-xs leading-relaxed ${hasText ? "text-gray-300" : "text-gray-600 italic"}`}>
+                {hasText
+                  ? out.description
+                  : (vlmEnabled ? "No output yet." : "VLM disabled.")}
+              </p>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 function buildVlmDescriptionEntries(status, alerts, persons) {
   const entries = []
 
@@ -418,6 +498,12 @@ function VlmDescriptionsCard({ status, alerts, persons }) {
 }
 
 function LiveStatsCard({ status, isRunning }) {
+  const classEntries = Object.entries(status?.class_counts ?? {})
+    .sort((a, b) => {
+      if (b[1] !== a[1]) return b[1] - a[1]
+      return a[0].localeCompare(b[0])
+    })
+
   const stats = [
     {
       icon: "👥", label: "Persons",
@@ -462,6 +548,35 @@ function LiveStatsCard({ status, isRunning }) {
           <p className="text-xs text-gray-400 leading-snug">
             {status.detection_summary}
           </p>
+        </div>
+      )}
+
+      {status?.yolo_enabled && (
+        <div className="mt-3 bg-gray-900/60 rounded-lg border border-gray-700/40 p-2.5">
+          <div className="flex items-center justify-between mb-2">
+            <p className="text-[11px] font-bold text-gray-500 uppercase tracking-wider">
+              Detected Classes
+            </p>
+            <span className="text-[11px] text-gray-600">
+              {classEntries.length}
+            </span>
+          </div>
+
+          {classEntries.length ? (
+            <div className="max-h-36 overflow-y-auto pr-1 flex flex-wrap gap-1.5">
+              {classEntries.map(([label, count]) => (
+                <span
+                  key={`${label}-${count}`}
+                  className="text-[11px] px-2 py-0.5 rounded-full border
+                             border-gray-700 bg-gray-800 text-gray-300"
+                >
+                  {count}x {label}
+                </span>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-gray-600">No objects detected in current frame.</p>
+          )}
         </div>
       )}
     </div>
@@ -640,6 +755,7 @@ function RightPanel({ status, alerts, persons, vram, isRunning }) {
           <>
             <AlertStatusCard status={status} />
             <SceneDescCard   status={status} />
+            <PromptOutputsCard outputs={status?.prompt_outputs} vlmEnabled={status?.vlm_enabled} />
             <VlmDescriptionsCard status={status} alerts={alerts} persons={persons} />
             <LiveStatsCard   status={status} isRunning={isRunning} />
             <WeaponsCard     detections={status?.weapon_detections} />
@@ -672,9 +788,13 @@ export default function App() {
   const [toggling,       setToggling]       = useState({ yolo: false, vlm: false })
   const [intervalInput,  setIntervalInput]  = useState(10)
   const [intervalSaving, setIntervalSaving] = useState(false)
+  const [intervalEditing, setIntervalEditing] = useState(false)
+  const [intervalDirty, setIntervalDirty] = useState(false)
   const [prompts,        setPrompts]        = useState({ proximity: "", count_change: "", weapon: "" })
   const [promptSaving,   setPromptSaving]   = useState({ proximity: false, count_change: false, weapon: false })
   const [promptSaved,    setPromptSaved]    = useState({ proximity: false, count_change: false, weapon: false })
+  const [promptEditing,  setPromptEditing]  = useState({ proximity: false, count_change: false, weapon: false })
+  const [promptDirty,    setPromptDirty]    = useState({ proximity: false, count_change: false, weapon: false })
 
   const fileRef = useRef(null)
 
@@ -690,13 +810,19 @@ export default function App() {
         ])
         if (s) {
           setStatus(s)
-          if (!intervalSaving)
+          if (!intervalSaving && !intervalEditing && !intervalDirty)
             setIntervalInput(Math.max(2, Math.min(30, Math.round(s.vlm_interval ?? 10))))
           if (s.trigger_prompts) {
             setPrompts(prev => ({
-              proximity:    promptSaving.proximity    ? prev.proximity    : (s.trigger_prompts.proximity    ?? ""),
-              count_change: promptSaving.count_change ? prev.count_change : (s.trigger_prompts.count_change ?? ""),
-              weapon:       promptSaving.weapon       ? prev.weapon       : (s.trigger_prompts.weapon       ?? ""),
+              proximity: (promptSaving.proximity || promptEditing.proximity || promptDirty.proximity)
+                ? prev.proximity
+                : (s.trigger_prompts.proximity ?? ""),
+              count_change: (promptSaving.count_change || promptEditing.count_change || promptDirty.count_change)
+                ? prev.count_change
+                : (s.trigger_prompts.count_change ?? ""),
+              weapon: (promptSaving.weapon || promptEditing.weapon || promptDirty.weapon)
+                ? prev.weapon
+                : (s.trigger_prompts.weapon ?? ""),
             }))
           }
           setToggling(prev => ({
@@ -712,7 +838,20 @@ export default function App() {
     poll()
     const iv = setInterval(poll, 800)
     return () => clearInterval(iv)
-  }, [intervalSaving, promptSaving.proximity, promptSaving.count_change, promptSaving.weapon])
+  }, [
+    intervalSaving,
+    intervalEditing,
+    intervalDirty,
+    promptSaving.proximity,
+    promptSaving.count_change,
+    promptSaving.weapon,
+    promptEditing.proximity,
+    promptEditing.count_change,
+    promptEditing.weapon,
+    promptDirty.proximity,
+    promptDirty.count_change,
+    promptDirty.weapon,
+  ])
 
   // ── Handlers ──────────────────────────────────────────────────────────────
   const toggleYolo = useCallback(async val => {
@@ -733,34 +872,64 @@ export default function App() {
     const v = Math.max(2, Math.min(30, Number(intervalInput)))
     setIntervalInput(v)
     setIntervalSaving(true)
-    try { await fetch(`${API}/vlm/interval?seconds=${v}`, { method: "POST" }) }
-    finally { setIntervalSaving(false) }
+    try {
+      const res = await fetch(`${API}/vlm/interval?seconds=${v}`, { method: "POST" })
+      if (res.ok) {
+        setIntervalDirty(false)
+      }
+    } finally {
+      setIntervalSaving(false)
+    }
   }
+
+  const onPromptChange = useCallback((type, value) => {
+    setPromptDirty(p => ({ ...p, [type]: true }))
+    setPrompts(p => ({ ...p, [type]: value }))
+  }, [])
 
   const savePrompt = async type => {
     setPromptSaving(p => ({ ...p, [type]: true }))
     try {
-      await fetch(
+      const res = await fetch(
         `${API}/trigger_prompts/${type}?${new URLSearchParams({ prompt: prompts[type] })}`,
         { method: "POST" }
       )
+      if (!res.ok) {
+        throw new Error("Failed to save trigger prompt")
+      }
+      setPromptDirty(p => ({ ...p, [type]: false }))
       setPromptSaved(p => ({ ...p, [type]: true }))
       setTimeout(() => setPromptSaved(p => ({ ...p, [type]: false })), 2000)
-    } finally { setPromptSaving(p => ({ ...p, [type]: false })) }
+    } catch (_) {
+      window.alert("Unable to save trigger prompt")
+    } finally {
+      setPromptSaving(p => ({ ...p, [type]: false }))
+    }
   }
 
   const clearPrompt = async type => {
     setPrompts(p => ({ ...p, [type]: "" }))
+    setPromptDirty(p => ({ ...p, [type]: false }))
     await fetch(`${API}/trigger_prompts/${type}`, { method: "DELETE" }).catch(() => {})
   }
 
   const startCamera = () =>
     fetch(`${API}/start/camera?index=${cameraIndex}`, { method: "POST" }).catch(() => {})
 
-  const startPath = () => {
+  const startPath = async () => {
     if (!rtspPath.trim()) return
-    fetch(`${API}/start/path?${new URLSearchParams({ path: rtspPath })}`,
-          { method: "POST" }).catch(() => {})
+    try {
+      const res = await fetch(
+        `${API}/start/path?${new URLSearchParams({ path: rtspPath })}`,
+        { method: "POST" }
+      )
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        window.alert(body?.detail || body?.error || "Unable to start stream from this link")
+      }
+    } catch (_) {
+      window.alert("Unable to reach backend server")
+    }
   }
 
   const startFile = async () => {
@@ -952,7 +1121,7 @@ export default function App() {
                       <input
                         value={rtspPath}
                         onChange={e => setRtspPath(e.target.value)}
-                        placeholder="rtsp://... or /path/to/video"
+                        placeholder="rtsp://... / direct .mp4 / webpage link"
                         className="text-xs bg-gray-800 border border-gray-700 rounded-lg
                                    px-2.5 py-1.5 text-white placeholder-gray-600
                                    focus:outline-none focus:border-blue-500"
@@ -960,7 +1129,7 @@ export default function App() {
                       <button onClick={startPath}
                               className="text-xs py-1.5 rounded-lg bg-blue-700
                                          hover:bg-blue-600 font-semibold transition-colors">
-                        ▶ Start RTSP
+                        ▶ Start Link
                       </button>
                     </div>
                   )}
@@ -1016,7 +1185,10 @@ export default function App() {
                     </p>
                     <div className="flex items-center gap-2">
                       <button
-                        onClick={() => setIntervalInput(v => Math.max(2, v - 1))}
+                        onClick={() => {
+                          setIntervalDirty(true)
+                          setIntervalInput(v => Math.max(2, v - 1))
+                        }}
                         className="w-8 h-8 rounded-lg bg-gray-700 hover:bg-gray-600
                                    text-white font-bold text-lg flex items-center
                                    justify-center shrink-0 transition-colors">
@@ -1025,15 +1197,21 @@ export default function App() {
                       <input
                         type="number" min={2} max={30}
                         value={intervalInput}
-                        onChange={e => setIntervalInput(
-                          Math.max(2, Math.min(30, Number(e.target.value)))
-                        )}
+                        onChange={e => {
+                          setIntervalDirty(true)
+                          setIntervalInput(Math.max(2, Math.min(30, Number(e.target.value))))
+                        }}
+                        onFocus={() => setIntervalEditing(true)}
+                        onBlur={() => setIntervalEditing(false)}
                         className="flex-1 text-center text-lg font-black bg-gray-800
                                    border border-gray-700 rounded-lg py-1.5 text-white
                                    focus:outline-none focus:border-blue-500"
                       />
                       <button
-                        onClick={() => setIntervalInput(v => Math.min(30, v + 1))}
+                        onClick={() => {
+                          setIntervalDirty(true)
+                          setIntervalInput(v => Math.min(30, v + 1))
+                        }}
                         className="w-8 h-8 rounded-lg bg-gray-700 hover:bg-gray-600
                                    text-white font-bold text-lg flex items-center
                                    justify-center shrink-0 transition-colors">
@@ -1070,7 +1248,9 @@ export default function App() {
                     key={type}
                     triggerType={type}
                     value={prompts[type]}
-                    onChange={v => setPrompts(p => ({ ...p, [type]: v }))}
+                    onChange={v => onPromptChange(type, v)}
+                    onFocus={() => setPromptEditing(p => ({ ...p, [type]: true }))}
+                    onBlur={() => setPromptEditing(p => ({ ...p, [type]: false }))}
                     onSave={() => savePrompt(type)}
                     onClear={() => clearPrompt(type)}
                     saving={promptSaving[type]}

@@ -17,5 +17,6 @@ numpy==1.26.4
 
 # Optional
 pydantic==2.9.0
+yt-dlp==2025.10.22
 
 num2words==0.5.14

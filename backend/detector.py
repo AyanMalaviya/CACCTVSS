@@ -1,27 +1,29 @@
-import cv2, time, json, threading, logging
+import cv2, time, json, threading, logging, re
 import numpy as np
 import torch
 from ultralytics import YOLO
 from PIL import Image
 from datetime import datetime
 from pathlib import Path
-from huggingface_hub import hf_hub_download
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-YOLO_MODEL_PATH = "yolo26n.pt"
+MODEL_DIR        = Path(__file__).resolve().parent
+YOLO_MODEL_PATH  = MODEL_DIR / "yolo11l.pt"
 VLM_MODEL_ID    = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
 
-THREAT_REPO     = "Subh775/Threat-Detection-YOLOv8n"
-THREAT_FILE     = "weights/best.pt"
-
-# Gun (cls 1) removed — too many false positives on furniture/chairs
-# Knife (cls 4) only from threat model
-# Axe / crowbar / scissors scanned from yolo26n class names
-ACTIVE_THREATS  = {"knife"}
-YOLO_EDGE_NAMES = {"axe", "crowbar", "scissors", "scissor", "blade", "machete"}
+# yolo11l is the single detector model used by this service.
+# Edge weapons are a subset of YOLO class names that we elevate to alerts.
+YOLO_EDGE_NAMES = {"axe", "crowbar", "scissors", "blade", "machete"}
+EDGE_WEAPON_PATTERNS = (
+    re.compile(r"\bscissor(?:s)?\b"),
+    re.compile(r"\bcrowbar(?:s)?\b"),
+    re.compile(r"\b(?:axe|axes|ax|hatchet)\b"),
+    re.compile(r"\bmachete(?:s)?\b"),
+    re.compile(r"\bblade(?:s)?\b"),
+)
 
 PROXIMITY_DURATION = 2.5
 RED_HOLD_SEC       = 6.0
@@ -30,6 +32,8 @@ RED_CONFIDENCE     = {"medium", "high"}
 WEAPON_COLORS = {
     "knife":   (0,   0,   255),   # red
     "axe":     (0,  128,  255),   # orange
+    "baseball bat": (255, 170, 0),
+    "bat":     (255, 170, 0),
     "crowbar": (0,  200,  150),   # teal
     "scissors":(200, 0,   200),   # magenta
 }
@@ -52,6 +56,7 @@ state = {
     "source_fps":        0.0,
     "person_log":        [],
     "person_count":      0,
+    "class_counts":      {},
     "yolo_enabled":      False,
     "vlm_enabled":       False,
     "vlm_interval":      10.0,       # passive scene interval 2–30s
@@ -61,12 +66,41 @@ state = {
         "count_change": "",
         "weapon":       "",
     },
+    "prompt_outputs": {
+        "proximity":    {"description": "", "time": ""},
+        "count_change": {"description": "", "time": ""},
+        "weapon":       {"description": "", "time": ""},
+        "scene":        {"description": "", "time": ""},
+    },
 }
 state_lock = threading.Lock()
 
 # Filled after model load
-threat_classes: dict = {}    # from threat model  {cls_id: label}
+yolo_all_classes: dict = {}  # from yolo26n names  {cls_id: label}
 yolo_edge_classes: dict = {} # from yolo26n names  {cls_id: label}
+
+
+def normalize_weapon_label(name: str) -> str:
+    """Normalize label variants so downstream logic/UI use consistent names."""
+    n = str(name).strip().lower()
+    if "scissor" in n:
+        return "scissors"
+    if "crowbar" in n:
+        return "crowbar"
+    if re.search(r"\b(?:axe|axes|ax|hatchet)\b", n):
+        return "axe"
+    if "machete" in n:
+        return "machete"
+    if "blade" in n:
+        return "blade"
+    return n
+
+
+def is_edge_weapon_name(name: str) -> bool:
+    n = str(name).strip().lower()
+    if normalize_weapon_label(n) in YOLO_EDGE_NAMES:
+        return True
+    return any(p.search(n) for p in EDGE_WEAPON_PATTERNS)
 
 # ── VLM abort event (used by StoppingCriteria) ────────────────────────────────
 vlm_abort = threading.Event()
@@ -90,44 +124,30 @@ def _init_abort_criteria():
 
 # ── Model loaders ─────────────────────────────────────────────────────────────
 def load_yolo():
-    log.info("Loading YOLO26n...")
-    model = YOLO(YOLO_MODEL_PATH)
+    log.info("Loading yolo11l...")
+    if not YOLO_MODEL_PATH.exists():
+        raise FileNotFoundError(f"yolo11l model not found: {YOLO_MODEL_PATH}")
+
+    model = YOLO(str(YOLO_MODEL_PATH))
+    names = model.names if isinstance(model.names, dict) else dict(enumerate(model.names))
+
+    yolo_all_classes.clear()
+    yolo_all_classes.update({int(cid): str(name) for cid, name in names.items()})
+
     # Scan class names for edge-case weapons (axe, crowbar, scissors…)
-    global yolo_edge_classes
-    yolo_edge_classes = {
-        cid: name
-        for cid, name in model.names.items()
-        if name.lower() in YOLO_EDGE_NAMES
-    }
+    yolo_edge_classes.clear()
+    yolo_edge_classes.update({
+        cid: normalize_weapon_label(name)
+        for cid, name in yolo_all_classes.items()
+        if is_edge_weapon_name(name)
+    })
+
     if yolo_edge_classes:
         log.info(f"[YOLO] Edge weapon classes found: {yolo_edge_classes}")
     else:
-        log.info("[YOLO] No axe/crowbar/scissors in yolo26n — only knife from threat model")
-    log.info(f"[YOLO] Ready — {len(model.names)} classes")
+        log.info("[YOLO] No edge-weapon class labels found in yolo11l names")
+    log.info(f"[YOLO] Ready — {len(yolo_all_classes)} classes")
     return model
-
-
-def load_threat_model():
-    global threat_classes
-    try:
-        log.info(f"[THREAT] Downloading {THREAT_REPO}...")
-        path  = hf_hub_download(repo_id=THREAT_REPO, filename=THREAT_FILE)
-        model = YOLO(path)
-        # Only keep classes in ACTIVE_THREATS (knife only — gun excluded)
-        threat_classes = {
-            cid: name
-            for cid, name in model.names.items()
-            if name.lower() in ACTIVE_THREATS
-        }
-        if not threat_classes:
-            threat_classes = {4: "knife"}  # known ID fallback
-        log.info(f"[THREAT] Loaded. Active: {threat_classes} | Skipped: gun/explosive/grenade")
-        return model
-    except Exception as e:
-        log.warning(f"[THREAT] Download failed: {e} — fallback YOLOv8n COCO")
-        model          = YOLO("yolov8n.pt")
-        threat_classes = {49: "knife"}
-        return model
 
 
 def load_vlm():
@@ -156,19 +176,18 @@ def load_vlm():
 
 # ── Default prompts ───────────────────────────────────────────────────────────
 DEFAULT_PROXIMITY_PROMPT = (
-    "Two people have come very close together in this surveillance image. "
-    "Describe what they are doing in one sentence. "
+    "Describe what people are doing."
     "Start with: Safe / Suspicious / Threatening — then explain."
 )
 DEFAULT_COUNT_CHANGE_PROMPT = (
     "The number of people in this camera view just changed. "
-    "Describe in one sentence what is currently happening. "
+    "Describe what is currently happening. "
     "Focus on actions and movement."
 )
 DEFAULT_WEAPON_PROMPT = (
-    "A potential bladed weapon has been detected in this surveillance image. "
-    "Is someone actively holding or using it? "
-    "Describe in one factual sentence what you see."
+    "A potential dangerous object is visible in this surveillance image. "
+    "Decide if a person is carrying/holding it and whether behavior appears threatening."
+    "Respond ONLY as JSON."
 )
 DEFAULT_SCENE_PROMPT = (
     "Describe exactly what is happening in this surveillance scene in one sentence. "
@@ -178,7 +197,7 @@ DEFAULT_SCENE_PROMPT = (
 
 # ── VLM inference ─────────────────────────────────────────────────────────────
 def smolvlm_infer(crop_bgr: np.ndarray, prompt: str,
-                  vlm_model, processor, max_tokens: int = 80) -> str:
+                  vlm_model, processor, max_tokens: int = 120) -> str:
     if vlm_abort.is_set():
         return ""
     if vlm_model is None or processor is None:
@@ -228,62 +247,116 @@ def smolvlm_infer(crop_bgr: np.ndarray, prompt: str,
         torch.cuda.empty_cache()
 
 
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    return text in {"true", "yes", "y", "1", "threat", "danger", "violent"}
+
+
+def _normalize_confidence(value: str, threat: bool) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"low", "medium", "high"}:
+        return text
+    if any(k in text for k in ["high", "certain", "strong"]):
+        return "high"
+    if any(k in text for k in ["medium", "moderate", "likely"]):
+        return "medium"
+    return "medium" if threat else "low"
+
+
 def run_vlm_threat(crop_bgr: np.ndarray, vlm_model, processor,
                    custom_prompt: str = "") -> dict:
-    prompt = custom_prompt or DEFAULT_WEAPON_PROMPT
-    raw    = smolvlm_infer(crop_bgr, prompt, vlm_model, processor, max_tokens=100)
+    schema_hint = (
+        "Return ONLY valid JSON with keys: "
+        "threat (boolean), type (string), confidence (low|medium|high), description (string)."
+    )
+    base_prompt = (custom_prompt or DEFAULT_WEAPON_PROMPT).strip()
+    prompt = f"{base_prompt}\n{schema_hint}"
+
+    raw = smolvlm_infer(crop_bgr, prompt, vlm_model, processor, max_tokens=120)
     if not raw:
-        return {"threat": False, "type": "none",
-                "confidence": "low", "description": "Aborted or no response"}
-    try:
-        js = raw[raw.rfind("{"):raw.rfind("}")+1]
-        return json.loads(js)
-    except Exception:
-        threat = "threat" in raw.lower() and "true" in raw.lower()
         return {
-            "threat":      threat,
-            "type":        "assault" if threat else "none",
-            "confidence":  "medium"  if threat else "low",
-            "description": raw[:120],
+            "threat": False,
+            "type": "none",
+            "confidence": "low",
+            "description": "Aborted or no response",
         }
+
+    text = raw.strip()
+    parsed = None
+    try:
+        match = re.search(r"\{[\s\S]*\}", text)
+        if match:
+            parsed = json.loads(match.group(0))
+    except Exception:
+        parsed = None
+
+    if parsed is not None:
+        threat = _as_bool(parsed.get("threat", False))
+        threat_type = str(parsed.get("type", "")).strip().lower() or ("weapon" if threat else "none")
+        confidence = _normalize_confidence(parsed.get("confidence", ""), threat)
+        description = str(parsed.get("description", "")).strip() or text[:180]
+        return {
+            "threat": threat,
+            "type": threat_type,
+            "confidence": confidence,
+            "description": description,
+        }
+
+    lower = text.lower()
+    danger_terms = ["threat", "attack", "assault", "violent", "weapon", "wield", "strike"]
+    safe_terms = ["not threatening", "no threat", "safe", "non-threatening", "harmless"]
+    threat = any(t in lower for t in danger_terms) and not any(t in lower for t in safe_terms)
+
+    threat_type = "none"
+    for t in ["baseball bat", "bat", "axe", "knife", "crowbar", "scissors", "blade", "machete"]:
+        if t in lower:
+            threat_type = "bat" if t in {"baseball bat", "bat"} else t
+            break
+    if threat and threat_type == "none":
+        threat_type = "weapon"
+
+    return {
+        "threat": threat,
+        "type": threat_type,
+        "confidence": "medium" if threat else "low",
+        "description": text[:180],
+    }
 
 
 # ── Weapon detection ──────────────────────────────────────────────────────────
-def run_weapons(threat_model: YOLO, frame: np.ndarray,
-                yolo_extra_boxes: list = None) -> tuple:
+def run_weapons(frame: np.ndarray, yolo_extra_boxes: list = None) -> tuple:
     """
-    Run threat model (knife only) + optionally pass axe/scissor detections
-    already found in yolo_extra_boxes from the main YOLO pass.
+    Use weapon detections already found in the main YOLO26n pass.
     Returns: (detections, trigger_reason, trigger_crop)
     """
     dets       = []
     fh, fw     = frame.shape[:2]
-    frame_area = fh * fw
 
-    # ── Threat model (knife) ──────────────────────────────────────────────────
-    if threat_model is not None:
-        results = threat_model(frame, conf=0.60, imgsz=640, verbose=False)
-        for box in results[0].boxes:
-            cid = int(box.cls[0])
-            if cid not in threat_classes:
-                continue
-            conf  = float(box.conf[0])
-            label = threat_classes[cid]
-            xyxy  = box.xyxy[0].cpu().numpy()
-            x1,y1,x2,y2 = map(int, xyxy)
-            bw, bh = x2-x1, y2-y1
-            area   = bw*bh
-            aspect = bw / max(bh, 1)
-            if area < frame_area*0.015:   continue
-            if label == "knife" and not (1.2 < aspect < 8.0): continue
-            if bw > fw*0.85 or bh > fh*0.85:  continue
-            dets.append({"label": label, "confidence": round(conf,2),
-                         "bbox": [x1,y1,x2,y2]})
-            log.info(f"[WEAPON] {label} @ {int(conf*100)}%")
-
-    # ── Edge weapons from main YOLO (axe/crowbar/scissors) ───────────────────
+    # ── Edge weapons from main YOLO26n ────────────────────────────────────────
     if yolo_extra_boxes:
-        dets.extend(yolo_extra_boxes)
+        for d in yolo_extra_boxes:
+            bbox = d.get("bbox", [])
+            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                continue
+            x1, y1, x2, y2 = [int(v) for v in bbox]
+            x1 = max(0, min(x1, fw - 1))
+            y1 = max(0, min(y1, fh - 1))
+            x2 = max(0, min(x2, fw - 1))
+            y2 = max(0, min(y2, fh - 1))
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            conf = float(d.get("confidence", 0.0))
+            dets.append({
+                "label":      normalize_weapon_label(d.get("label", "")),
+                "confidence": max(0.0, min(conf, 1.0)),
+                "bbox":       [x1, y1, x2, y2],
+            })
+            log.info(f"[WEAPON] {dets[-1]['label']} @ {int(dets[-1]['confidence']*100)}%")
 
     trigger = None
     crop    = None
