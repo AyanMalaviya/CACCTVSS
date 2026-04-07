@@ -1,8 +1,9 @@
+import csv
 import threading, time, cv2, logging, numpy as np, torch
 import importlib
 from urllib.parse import urlparse
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 from datetime import datetime
@@ -20,7 +21,11 @@ from detector import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-UPLOAD_DIR = Path("uploads"); UPLOAD_DIR.mkdir(exist_ok=True)
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = BASE_DIR / "uploads"; UPLOAD_DIR.mkdir(exist_ok=True)
+PROMPT_CSV_DIR = BASE_DIR / "logs"; PROMPT_CSV_DIR.mkdir(exist_ok=True)
+PROMPT_CSV_PATH = PROMPT_CSV_DIR / "prompt_outputs.csv"
+prompt_csv_lock = threading.Lock()
 
 STREAM_W           = 1280
 STREAM_H           = 720
@@ -291,10 +296,80 @@ def _empty_prompt_outputs() -> dict:
     }
 
 
+def _ensure_prompt_csv_header():
+    needs_header = (not PROMPT_CSV_PATH.exists()) or PROMPT_CSV_PATH.stat().st_size == 0
+    if not needs_header:
+        return
+
+    with PROMPT_CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["type", "timeline", "description"])
+
+
+def _append_prompt_csv_row(prompt_type: str, timeline: str, description: str):
+    try:
+        with prompt_csv_lock:
+            _ensure_prompt_csv_header()
+            with PROMPT_CSV_PATH.open("a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([prompt_type, timeline, description])
+    except Exception as e:
+        log.warning(f"[PROMPT CSV] Append failed: {e}")
+
+
+def _read_prompt_csv_rows_unlocked() -> list[dict]:
+    _ensure_prompt_csv_header()
+    rows = []
+    with PROMPT_CSV_PATH.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for idx, row in enumerate(reader, start=1):
+            rows.append({
+                "id": idx,
+                "type": str(row.get("type", "") or ""),
+                "timeline": str(row.get("timeline", "") or ""),
+                "description": str(row.get("description", "") or ""),
+            })
+    return rows
+
+
+def _write_prompt_csv_rows_unlocked(rows: list[dict]):
+    with PROMPT_CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["type", "timeline", "description"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({
+                "type": str(row.get("type", "") or ""),
+                "timeline": str(row.get("timeline", "") or ""),
+                "description": str(row.get("description", "") or ""),
+            })
+
+
+def _matches_prompt_filters(row: dict, type_filter: str, timeline_filter: str, description_filter: str) -> bool:
+    t = str(type_filter or "").strip().lower()
+    tl = str(timeline_filter or "").strip().lower()
+    d = str(description_filter or "").strip().lower()
+
+    row_type = str(row.get("type", "") or "").lower()
+    row_timeline = str(row.get("timeline", "") or "").lower()
+    row_description = str(row.get("description", "") or "").lower()
+
+    if t and t not in row_type:
+        return False
+    if tl and tl not in row_timeline:
+        return False
+    if d and d not in row_description:
+        return False
+    return True
+
+
 def _record_prompt_output_locked(prompt_type: str, description: str):
     desc = str(description or "").strip()
     if not desc:
         return
+
+    now_dt = datetime.now()
+    timeline = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    ui_time = now_dt.strftime("%H:%M:%S")
 
     outputs = state.get("prompt_outputs")
     if not isinstance(outputs, dict):
@@ -303,8 +378,9 @@ def _record_prompt_output_locked(prompt_type: str, description: str):
 
     outputs[prompt_type] = {
         "description": desc,
-        "time": datetime.now().strftime("%H:%M:%S"),
+        "time": ui_time,
     }
+    _append_prompt_csv_row(prompt_type, timeline, desc)
 
 # ── VLM Priority Task Manager ─────────────────────────────────────────────────
 # "trigger" tasks (weapon/proximity/count_change) preempt "passive" tasks.
@@ -907,6 +983,98 @@ def get_status():
             },
             "vram_pct":          round(get_vram_pct(), 1),
         }
+
+
+@app.get("/prompt_outputs/csv")
+def get_prompt_outputs_csv():
+    try:
+        with prompt_csv_lock:
+            _ensure_prompt_csv_header()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unable to prepare prompt output CSV: {e}")
+
+    return FileResponse(
+        path=str(PROMPT_CSV_PATH),
+        media_type="text/csv",
+        filename="prompt_outputs.csv",
+    )
+
+
+@app.get("/prompt_outputs/records")
+def get_prompt_output_records(type: str = "", timeline: str = "", description: str = ""):
+    try:
+        with prompt_csv_lock:
+            rows = _read_prompt_csv_rows_unlocked()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unable to read prompt output records: {e}")
+
+    filtered = [
+        row for row in rows
+        if _matches_prompt_filters(row, type, timeline, description)
+    ]
+    filtered.sort(key=lambda r: int(r.get("id", 0)), reverse=True)
+
+    return {
+        "records": filtered,
+        "count": len(filtered),
+        "total": len(rows),
+        "filters": {
+            "type": type,
+            "timeline": timeline,
+            "description": description,
+        },
+    }
+
+
+@app.delete("/prompt_outputs/records/{record_id}")
+def delete_prompt_output_record(record_id: int):
+    if record_id <= 0:
+        raise HTTPException(status_code=400, detail="record_id must be > 0")
+
+    try:
+        with prompt_csv_lock:
+            rows = _read_prompt_csv_rows_unlocked()
+            exists = any(int(row.get("id", 0)) == record_id for row in rows)
+            if not exists:
+                raise HTTPException(status_code=404, detail="Record not found")
+
+            remaining = [row for row in rows if int(row.get("id", 0)) != record_id]
+            _write_prompt_csv_rows_unlocked(remaining)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unable to delete record: {e}")
+
+    return {
+        "deleted_id": record_id,
+        "remaining": len(remaining),
+    }
+
+
+@app.delete("/prompt_outputs/records")
+def clear_prompt_output_records(type: str = "", timeline: str = "", description: str = ""):
+    try:
+        with prompt_csv_lock:
+            rows = _read_prompt_csv_rows_unlocked()
+            to_delete = [
+                row for row in rows
+                if _matches_prompt_filters(row, type, timeline, description)
+            ]
+            delete_ids = {int(row.get("id", 0)) for row in to_delete}
+            remaining = [row for row in rows if int(row.get("id", 0)) not in delete_ids]
+            _write_prompt_csv_rows_unlocked(remaining)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unable to clear records: {e}")
+
+    return {
+        "deleted": len(to_delete),
+        "remaining": len(remaining),
+        "filters": {
+            "type": type,
+            "timeline": timeline,
+            "description": description,
+        },
+    }
 
 @app.get("/alerts")
 def get_alerts():

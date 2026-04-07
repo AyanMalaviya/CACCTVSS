@@ -349,9 +349,22 @@ function PromptOutputsCard({ outputs, vlmEnabled }) {
         <span className="text-xs font-bold text-gray-500 uppercase tracking-wider">
           🎯 Prompt Outputs
         </span>
-        <span className="text-[11px] text-gray-600">
-          Latest from 4 prompt flows
-        </span>
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-gray-600">
+            Latest from 4 prompt flows
+          </span>
+          <a
+            href={`${API}/prompt_outputs/csv`}
+            target="_blank"
+            rel="noreferrer"
+            className="text-[11px] px-2 py-0.5 rounded-full border border-gray-700
+                       bg-gray-800 text-gray-300 hover:text-white hover:bg-gray-700
+                       transition-colors"
+            title="Open prompt outputs CSV"
+          >
+            ⬇ CSV
+          </a>
+        </div>
       </div>
 
       <div className="flex flex-col gap-2">
@@ -715,6 +728,245 @@ function PersonsList({ persons, vlmEnabled }) {
   )
 }
 
+function PromptLogsDashboard() {
+  const [filters, setFilters] = useState({ type: "", timeline: "", description: "" })
+  const [records, setRecords] = useState([])
+  const [total, setTotal] = useState(0)
+  const [loading, setLoading] = useState(false)
+  const [deletingId, setDeletingId] = useState(null)
+  const [clearing, setClearing] = useState(false)
+
+  const buildQuery = useCallback(() => {
+    const params = new URLSearchParams()
+    if (filters.type.trim()) params.set("type", filters.type.trim())
+    if (filters.timeline.trim()) params.set("timeline", filters.timeline.trim())
+    if (filters.description.trim()) params.set("description", filters.description.trim())
+    return params.toString()
+  }, [filters.type, filters.timeline, filters.description])
+
+  const loadRecords = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true)
+    try {
+      const query = buildQuery()
+      const url = query
+        ? `${API}/prompt_outputs/records?${query}`
+        : `${API}/prompt_outputs/records`
+
+      const res = await fetch(url)
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(body?.detail || "Failed to load prompt records")
+      }
+
+      setRecords(Array.isArray(body.records) ? body.records : [])
+      setTotal(Number(body.total ?? 0))
+    } catch (err) {
+      if (!silent) {
+        window.alert(err?.message || "Unable to load prompt records")
+      }
+    } finally {
+      if (!silent) setLoading(false)
+    }
+  }, [buildQuery])
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      loadRecords(false)
+    }, 250)
+    return () => clearTimeout(timer)
+  }, [loadRecords])
+
+  useEffect(() => {
+    const iv = setInterval(() => {
+      loadRecords(true)
+    }, 2500)
+    return () => clearInterval(iv)
+  }, [loadRecords])
+
+  const deleteRecord = async recordId => {
+    if (!window.confirm("Delete this record?")) return
+    setDeletingId(recordId)
+    try {
+      const res = await fetch(`${API}/prompt_outputs/records/${recordId}`, { method: "DELETE" })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(body?.detail || "Failed to delete record")
+      }
+      await loadRecords(false)
+    } catch (err) {
+      window.alert(err?.message || "Unable to delete record")
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
+  const clearRecords = async () => {
+    const hasFilters = Boolean(
+      filters.type.trim() || filters.timeline.trim() || filters.description.trim()
+    )
+    const message = hasFilters
+      ? "Delete all records matching current filters?"
+      : "Delete all prompt records?"
+    if (!window.confirm(message)) return
+
+    setClearing(true)
+    try {
+      const query = buildQuery()
+      const url = query
+        ? `${API}/prompt_outputs/records?${query}`
+        : `${API}/prompt_outputs/records`
+      const res = await fetch(url, { method: "DELETE" })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(body?.detail || "Failed to clear records")
+      }
+      await loadRecords(false)
+    } catch (err) {
+      window.alert(err?.message || "Unable to clear records")
+    } finally {
+      setClearing(false)
+    }
+  }
+
+  const resetFilters = () => {
+    setFilters({ type: "", timeline: "", description: "" })
+  }
+
+  const hasFilters = Boolean(
+    filters.type.trim() || filters.timeline.trim() || filters.description.trim()
+  )
+
+  return (
+    <div className="p-4 flex flex-col gap-3">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <p className="text-xs font-bold text-gray-500 uppercase tracking-wider">
+            🧾 Prompt Records Dashboard
+          </p>
+          <p className="text-xs text-gray-600 mt-1">
+            Showing {records.length} of {total} records
+          </p>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={() => loadRecords(false)}
+            className="text-xs px-2.5 py-1 rounded-lg border border-gray-700 bg-gray-800
+                       text-gray-300 hover:text-white hover:bg-gray-700 transition-colors"
+          >
+            ↻ Refresh
+          </button>
+          <a
+            href={`${API}/prompt_outputs/csv`}
+            target="_blank"
+            rel="noreferrer"
+            className="text-xs px-2.5 py-1 rounded-lg border border-gray-700 bg-gray-800
+                       text-gray-300 hover:text-white hover:bg-gray-700 transition-colors"
+          >
+            ⬇ CSV
+          </a>
+          <button
+            onClick={clearRecords}
+            disabled={clearing || loading}
+            className="text-xs px-2.5 py-1 rounded-lg border border-red-800 bg-red-950/50
+                       text-red-300 hover:bg-red-900/60 transition-colors disabled:opacity-50"
+          >
+            {clearing ? "Clearing..." : hasFilters ? "Clear Filtered" : "Clear All"}
+          </button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-3 gap-2">
+        <input
+          value={filters.type}
+          onChange={e => setFilters(prev => ({ ...prev, type: e.target.value }))}
+          placeholder="Filter type"
+          className="text-xs bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5
+                     text-white placeholder-gray-600 focus:outline-none focus:border-blue-500"
+        />
+        <input
+          value={filters.timeline}
+          onChange={e => setFilters(prev => ({ ...prev, timeline: e.target.value }))}
+          placeholder="Filter timeline"
+          className="text-xs bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5
+                     text-white placeholder-gray-600 focus:outline-none focus:border-blue-500"
+        />
+        <div className="flex gap-1.5">
+          <input
+            value={filters.description}
+            onChange={e => setFilters(prev => ({ ...prev, description: e.target.value }))}
+            placeholder="Filter description"
+            className="flex-1 text-xs bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5
+                       text-white placeholder-gray-600 focus:outline-none focus:border-blue-500"
+          />
+          <button
+            onClick={resetFilters}
+            className="text-xs px-2 py-1.5 rounded-lg border border-gray-700 bg-gray-800
+                       text-gray-400 hover:text-white hover:bg-gray-700 transition-colors"
+            title="Reset filters"
+          >
+            ✕
+          </button>
+        </div>
+      </div>
+
+      <div className="rounded-xl border border-gray-800 bg-gray-900/60 overflow-auto max-h-[72vh]">
+        <table className="w-full text-xs">
+          <thead className="sticky top-0 bg-gray-900 border-b border-gray-800">
+            <tr>
+              <th className="text-left px-3 py-2 text-gray-500 font-semibold">Type</th>
+              <th className="text-left px-3 py-2 text-gray-500 font-semibold">Timeline</th>
+              <th className="text-left px-3 py-2 text-gray-500 font-semibold">Description</th>
+              <th className="text-right px-3 py-2 text-gray-500 font-semibold">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading && !records.length ? (
+              <tr>
+                <td colSpan={4} className="px-3 py-6 text-center text-gray-600">
+                  Loading records...
+                </td>
+              </tr>
+            ) : records.length ? (
+              records.map(rec => (
+                <tr key={rec.id} className="border-b border-gray-800/60 hover:bg-gray-800/40">
+                  <td className="px-3 py-2 align-top">
+                    <span className="inline-flex px-2 py-0.5 rounded-full border border-blue-900
+                                     bg-blue-950/40 text-blue-300 font-semibold capitalize">
+                      {rec.type || "-"}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2 align-top text-gray-400 font-mono whitespace-nowrap">
+                    {rec.timeline || "-"}
+                  </td>
+                  <td className="px-3 py-2 align-top text-gray-300 max-w-[420px] break-words">
+                    {rec.description || "-"}
+                  </td>
+                  <td className="px-3 py-2 align-top text-right">
+                    <button
+                      onClick={() => deleteRecord(rec.id)}
+                      disabled={deletingId === rec.id}
+                      className="text-[11px] px-2 py-1 rounded border border-red-800 bg-red-950/40
+                                 text-red-300 hover:bg-red-900/60 transition-colors disabled:opacity-50"
+                    >
+                      {deletingId === rec.id ? "Deleting..." : "Delete"}
+                    </button>
+                  </td>
+                </tr>
+              ))
+            ) : (
+              <tr>
+                <td colSpan={4} className="px-3 py-6 text-center text-gray-600">
+                  No records found for current filters.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
 // ── Right panel container ─────────────────────────────────────────────────────
 function RightPanel({ status, alerts, persons, vram, isRunning }) {
   const [tab, setTab] = useState("status")
@@ -722,11 +974,11 @@ function RightPanel({ status, alerts, persons, vram, isRunning }) {
     { id: "status",  icon: "📊", label: "Status"                              },
     { id: "alerts",  icon: "🚨", label: "Alerts",  count: alerts.length       },
     { id: "persons", icon: "👤", label: "Persons", count: persons.length      },
+    { id: "logs",    icon: "🧾", label: "Logs"                                },
   ]
 
   return (
-    <aside className="w-72 shrink-0 bg-gray-900 border-l border-gray-800
-                      flex flex-col overflow-hidden">
+    <aside className={`${tab === "logs" ? "w-[52rem]" : "w-72"} shrink-0 bg-gray-900 border-l border-gray-800 flex flex-col overflow-hidden`}>
       {/* Tab bar */}
       <div className="flex border-b border-gray-800 shrink-0">
         {TABS.map(t => (
@@ -764,6 +1016,7 @@ function RightPanel({ status, alerts, persons, vram, isRunning }) {
         )}
         {tab === "alerts"  && <AlertsList  alerts={alerts} />}
         {tab === "persons" && <PersonsList persons={persons} vlmEnabled={status?.vlm_enabled} />}
+        {tab === "logs"    && <PromptLogsDashboard />}
       </div>
     </aside>
   )
