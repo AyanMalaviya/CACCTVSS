@@ -1,4 +1,4 @@
-import csv
+import csv, re
 import threading, time, cv2, logging, numpy as np, torch
 import importlib
 from urllib.parse import urlparse
@@ -31,13 +31,13 @@ STREAM_W           = 1280
 STREAM_H           = 720
 STREAM_FPS         = 30
 VLM_THREAD_TIMEOUT = 20.0
-WEAPON_MIN_FRAMES  = 3
-EDGE_WEAPON_MIN_CONF = 0.30
-YOLO_DET_CONF      = 0.12
+WEAPON_MIN_FRAMES  = 2
+EDGE_WEAPON_MIN_CONF = 0.18
+YOLO_DET_CONF      = 0.10
 YOLO_DET_IMGSZ     = 960
 YOLO_TRACK_CONF    = 0.20
 YOLO_TRACK_IMGSZ   = 736
-CARRY_OBJECT_MIN_CONF = 0.24
+CARRY_OBJECT_MIN_CONF = 0.16
 CARRY_TRIGGER_MIN_FRAMES = 2
 CARRY_ASSOC_IOU_MIN = 0.02
 CARRY_PERSON_PAD_RATIO = 0.22
@@ -46,6 +46,11 @@ CARRY_OBJECT_LABELS = {
     "baseball bat",
     "bat",
     "axe",
+    "knife",
+    "machete",
+    "blade",
+    "crowbar",
+    "scissors",
 }
 
 # Classes to suppress from detection overlays/counts.
@@ -65,12 +70,52 @@ EXCLUDED_CLASS_ALIASES = {
     "couch"
 }
 
+# Restrict detection to person + weapon-relevant classes to reduce yolo11l noise.
+FOCUSED_CLASS_ALIASES = {
+    "person",
+    "knife",
+    "kitchen knife",
+    "dagger",
+    "scissors",
+    "scissor",
+    "baseball bat",
+    "bat",
+    "axe",
+    "axes",
+    "ax",
+    "hatchet",
+    "crowbar",
+    "blade",
+    "machete",
+}
+
 
 def _normalize_class_alias(label: str) -> str:
     return str(label).strip().lower().replace("_", " ").replace("-", " ")
 
 
 def _build_detection_class_ids() -> list[int]:
+    keep_ids = []
+    kept_labels = []
+    skipped_labels = []
+
+    for cid in sorted(yolo_all_classes):
+        label = str(yolo_all_classes[cid])
+        normalized = _normalize_class_alias(label)
+        if (normalized in FOCUSED_CLASS_ALIASES
+                or is_edge_weapon_name(normalized)):
+            keep_ids.append(cid)
+            kept_labels.append(label)
+            continue
+        skipped_labels.append(label)
+
+    if keep_ids:
+        log.info(f"[YOLO] Focused classes enabled: {sorted(set(kept_labels))}")
+        log.info(f"[YOLO] Skipping non-focused classes: {len(set(skipped_labels))}")
+        return keep_ids
+
+    # Fallback to exclusion mode if focused labels were not available
+    # in the model class map.
     keep_ids = []
     skipped_labels = []
     for cid in sorted(yolo_all_classes):
@@ -382,6 +427,22 @@ def _record_prompt_output_locked(prompt_type: str, description: str):
     }
     _append_prompt_csv_row(prompt_type, timeline, desc)
 
+
+def _sanitize_prompt_description(text: str) -> str:
+    desc = str(text or "").replace("\r", "\n").strip()
+    if not desc:
+        return ""
+
+    desc = re.sub(r"\s+", " ", desc).strip("`\"' ")
+    if not desc:
+        return ""
+
+    # Drop malformed punctuation-only fragments like "}" from model glitches.
+    if re.fullmatch(r"[\{\}\[\]\(\)\|\\/,:;.!?+\-_]+", desc):
+        return ""
+
+    return desc
+
 # ── VLM Priority Task Manager ─────────────────────────────────────────────────
 # "trigger" tasks (weapon/proximity/count_change) preempt "passive" tasks.
 # Triggers never interrupt other triggers — first one wins.
@@ -496,23 +557,40 @@ def run_engine(source):
     log.info(f"Stream: {source} @ {fps:.0f}fps")
 
     # ── VLM callbacks ─────────────────────────────────────────────────────────
-    def do_weapon_vlm(crop, prompt):
+    def do_weapon_vlm(crop, prompt, detected_label="weapon"):
         r = run_vlm_threat(crop, vlm_model, vlm_processor, prompt)
-        kind = (r.get("type") or "weapon").strip() if isinstance(r.get("type"), str) else "weapon"
-        desc = r.get("description", "")
+        raw_kind = (r.get("type") or "").strip() if isinstance(r.get("type"), str) else ""
+        norm_kind = normalize_weapon_label(raw_kind) if raw_kind else ""
+        fallback_kind = normalize_weapon_label(detected_label or "weapon")
+        kind = norm_kind if norm_kind and norm_kind != "none" else fallback_kind
+
+        desc = _sanitize_prompt_description(r.get("description", ""))
+        payload = dict(r)
+        payload["type"] = kind
+
+        if not desc:
+            desc = (
+                f"Threat review indicates potentially aggressive handling of {kind}."
+                if payload.get("threat")
+                else f"Carry incident reviewed for {kind}."
+            )
+        payload["description"] = desc
+
         with state_lock:
             state["vlm_description"] = desc
             if desc:
                 state["scene_description"] = desc
             _record_prompt_output_locked("weapon", desc)
-        if r.get("threat") and r.get("confidence") in RED_CONFIDENCE:
-            push_alert("RED", f"Threat confirmed: {kind}", r)
+        if payload.get("threat") and payload.get("confidence") in RED_CONFIDENCE:
+            push_alert("RED", f"Threat confirmed: {kind}", payload)
         else:
-            push_alert("YELLOW", f"Carry incident reviewed: {kind}", r)
+            push_alert("YELLOW", f"Carry incident reviewed: {kind}", payload)
 
     def do_proximity_vlm(crop, prompt):
-        desc = smolvlm_infer(crop, prompt or DEFAULT_PROXIMITY_PROMPT,
-                             vlm_model, vlm_processor, max_tokens=80)
+        desc = _sanitize_prompt_description(
+            smolvlm_infer(crop, prompt or DEFAULT_PROXIMITY_PROMPT,
+                          vlm_model, vlm_processor, max_tokens=80)
+        )
         if not desc: return
         threat = any(w in desc.lower() for w in
                      ["threatening", "assault", "attack", "fight", "danger"])
@@ -532,8 +610,10 @@ def run_engine(source):
             _record_prompt_output_locked("proximity", desc)
 
     def do_count_change_vlm(crop, prompt):
-        desc = smolvlm_infer(crop, prompt or DEFAULT_COUNT_CHANGE_PROMPT,
-                             vlm_model, vlm_processor, max_tokens=60)
+        desc = _sanitize_prompt_description(
+            smolvlm_infer(crop, prompt or DEFAULT_COUNT_CHANGE_PROMPT,
+                          vlm_model, vlm_processor, max_tokens=60)
+        )
         if desc:
             with state_lock:
                 state["scene_description"] = desc
@@ -542,8 +622,10 @@ def run_engine(source):
             log.info(f"[COUNT VLM] {desc}")
 
     def do_scene_vlm(crop, prompt):
-        desc = smolvlm_infer(crop, prompt or DEFAULT_SCENE_PROMPT,
-                             vlm_model, vlm_processor, max_tokens=60)
+        desc = _sanitize_prompt_description(
+            smolvlm_infer(crop, prompt or DEFAULT_SCENE_PROMPT,
+                          vlm_model, vlm_processor, max_tokens=60)
+        )
         if desc:
             with state_lock:
                 state["scene_description"] = desc
@@ -738,10 +820,18 @@ def run_engine(source):
                         carry_reason,
                         carry_crop,
                         _incident_weapon_prompt(best_carry["label"]),
+                        best_carry["label"],
                     )
                     annotated = draw_weapons(annotated, weapon_dets)
                 elif weapon_consecutive >= WEAPON_MIN_FRAMES and w_trigger:
-                    yolo_trigger = ("weapon", w_trigger, w_crop, "")
+                    best_weapon = max(w_dets, key=lambda d: d["confidence"]) if w_dets else None
+                    yolo_trigger = (
+                        "weapon",
+                        w_trigger,
+                        w_crop,
+                        "",
+                        (best_weapon or {}).get("label", "weapon"),
+                    )
                     annotated    = draw_weapons(annotated, weapon_dets)
 
                 with state_lock:
@@ -758,12 +848,21 @@ def run_engine(source):
                             f"Sustained contact — IDs {pair_ids}",
                             crop,
                             "",
+                            "",
                         )
 
-                # ── Count change tracking (no alert/VLM trigger) ──────────────
+                # ── Count change trigger ───────────────────────────────────────
                 cur_count = person_count_total
                 if cur_count != prev_count and prev_count != -1:
                     log.info(f"[COUNT] {prev_count} → {cur_count}")
+                    if yolo_trigger is None:
+                        yolo_trigger = (
+                            "count_change",
+                            f"Person count changed: {prev_count} → {cur_count}",
+                            frame.copy(),
+                            "",
+                            "",
+                        )
                 prev_count = cur_count
 
             # ── VLM trigger dispatch ──────────────────────────────────────────
@@ -773,18 +872,21 @@ def run_engine(source):
                 last_vlm  = state["last_vlm_time"]
 
             if yolo_trigger:
-                kind, reason, crop, auto_prompt = yolo_trigger
+                kind, reason, crop, auto_prompt, label_hint = yolo_trigger
                 if vlm_on and vlm_model and get_vram_pct() < 75:
                     with state_lock:
                         state["last_vlm_time"] = now
                     if kind == "weapon":
                         weapon_prompt = (prompts.get("weapon", "") or "").strip() or auto_prompt
                         launch_vlm("trigger", do_weapon_vlm,
-                                   (crop.copy(), weapon_prompt))
+                                   (crop.copy(), weapon_prompt, label_hint))
                     elif kind == "proximity":
                         launch_vlm("trigger", do_proximity_vlm,
                                    (crop.copy(), prompts.get("proximity", "")))
-                if cur_alert == "CLEAR":
+                    elif kind == "count_change":
+                        launch_vlm("trigger", do_count_change_vlm,
+                                   (crop.copy(), prompts.get("count_change", "")))
+                if cur_alert == "CLEAR" and kind != "count_change":
                     push_alert("YELLOW", reason)
 
             # ── Passive scene VLM (interval-based) ────────────────────────────

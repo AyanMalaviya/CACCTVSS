@@ -16,8 +16,9 @@ VLM_MODEL_ID    = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
 
 # yolo11l is the single detector model used by this service.
 # Edge weapons are a subset of YOLO class names that we elevate to alerts.
-YOLO_EDGE_NAMES = {"axe", "crowbar", "scissors", "blade", "machete"}
+YOLO_EDGE_NAMES = {"knife", "axe", "crowbar", "scissors", "blade", "machete"}
 EDGE_WEAPON_PATTERNS = (
+    re.compile(r"\b(?:knife|knives|dagger|switchblade)\b"),
     re.compile(r"\bscissor(?:s)?\b"),
     re.compile(r"\bcrowbar(?:s)?\b"),
     re.compile(r"\b(?:axe|axes|ax|hatchet)\b"),
@@ -83,6 +84,8 @@ yolo_edge_classes: dict = {} # from yolo26n names  {cls_id: label}
 def normalize_weapon_label(name: str) -> str:
     """Normalize label variants so downstream logic/UI use consistent names."""
     n = str(name).strip().lower()
+    if re.search(r"\b(?:knife|knives|dagger|switchblade)\b", n):
+        return "knife"
     if "scissor" in n:
         return "scissors"
     if "crowbar" in n:
@@ -176,7 +179,7 @@ def load_vlm():
 
 # ── Default prompts ───────────────────────────────────────────────────────────
 DEFAULT_PROXIMITY_PROMPT = (
-    "Describe what people are doing."
+    "Describe what people are doing. "
     "Start with: Safe / Suspicious / Threatening — then explain."
 )
 DEFAULT_COUNT_CHANGE_PROMPT = (
@@ -186,7 +189,7 @@ DEFAULT_COUNT_CHANGE_PROMPT = (
 )
 DEFAULT_WEAPON_PROMPT = (
     "A potential dangerous object is visible in this surveillance image. "
-    "Decide if a person is carrying/holding it and whether behavior appears threatening."
+    "Decide if a person is carrying/holding it and whether behavior appears threatening. "
     "Respond ONLY as JSON."
 )
 DEFAULT_SCENE_PROMPT = (
